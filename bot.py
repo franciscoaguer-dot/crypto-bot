@@ -5,12 +5,12 @@ El bot opera solo cuando 2+ señales coinciden en la misma dirección.
 """
 
 import os
+import re
 import time
 import json
 import logging
 import requests
 from datetime import datetime
-from typing import Optional
 import ccxt
 import pandas as pd
 import numpy as np
@@ -31,6 +31,8 @@ log = logging.getLogger(__name__)
 BINANCE_API_KEY    = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
+TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CAPITAL_TOTAL_USD  = float(os.environ.get("CAPITAL_USD", "100"))
 RISK_PER_TRADE     = 0.03        # 3% del capital por operación
@@ -39,8 +41,26 @@ TAKE_PROFIT_PCT    = 0.04        # 4% take profit (ratio 1:2)
 MIN_SIGNALS        = 2           # mínimo de señales para operar
 LOOP_INTERVAL_SEC  = 300         # cada 5 minutos
 
-# Pares a monitorear (los más líquidos en Binance)
 WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+
+# ─────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────
+def send_telegram(msg: str):
+    """Envía mensaje a Telegram."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        log.info("📱 Telegram enviado")
+    except Exception as e:
+        log.warning(f"Telegram error: {e}")
+
 
 # ─────────────────────────────────────────
 # EXCHANGE
@@ -65,7 +85,6 @@ def get_exchange() -> ccxt.binance:
 # INDICADORES TÉCNICOS
 # ─────────────────────────────────────────
 def get_ohlcv(exchange: ccxt.binance, symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
-    """Descarga velas OHLCV y devuelve DataFrame."""
     raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -73,40 +92,25 @@ def get_ohlcv(exchange: ccxt.binance, symbol: str, timeframe: str = "1h", limit:
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula EMA9, EMA21, RSI14."""
     df = df.copy()
-
-    # EMAs
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
-
-    # RSI 14
-    delta = df["close"].diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
+    delta    = df["close"].diff()
+    gain     = delta.clip(lower=0)
+    loss     = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=13, adjust=False).mean()
     avg_loss = loss.ewm(com=13, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs       = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
-
     return df
 
 
 def technical_signal(df: pd.DataFrame) -> int:
-    """
-    Retorna:
-      +1 = bullish  (EMA crossover alcista + RSI < 65)
-      -1 = bearish  (EMA crossover bajista + RSI > 35)
-       0 = neutral
-    """
-    last  = df.iloc[-1]
-    prev  = df.iloc[-2]
-
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
     ema_cross_bull = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"]
     ema_cross_bear = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"]
-
     rsi = last["rsi"]
-
     if ema_cross_bull and rsi < 65:
         return +1
     if ema_cross_bear and rsi > 35:
@@ -133,15 +137,8 @@ COIN_NAMES = {
 }
 
 def get_news_sentiment(symbol: str) -> int:
-    """
-    Lee RSS feeds gratuitos de CoinDesk y Cointelegraph.
-    Filtra por coin y analiza sentimiento por keywords.
-    Retorna +1 / -1 / 0
-    """
-    import re
     coin = symbol.split("/")[0].lower()
     search_terms = COIN_NAMES.get(coin, [coin])
-
     all_titles = []
     for feed_url in RSS_FEEDS:
         try:
@@ -165,7 +162,6 @@ def get_news_sentiment(symbol: str) -> int:
     titles_text = " ".join(relevant)
     bull_count = sum(1 for kw in BULLISH_KEYWORDS if kw in titles_text)
     bear_count = sum(1 for kw in BEARISH_KEYWORDS if kw in titles_text)
-
     log.info(f"  Noticias relevantes: {len(relevant)} | bull={bull_count} bear={bear_count}")
 
     if bull_count > bear_count:
@@ -176,13 +172,9 @@ def get_news_sentiment(symbol: str) -> int:
 
 
 # ─────────────────────────────────────────
-# ANÁLISIS CON CLAUDE (solo cuando hay señal)
+# ANÁLISIS CON CLAUDE
 # ─────────────────────────────────────────
 def ask_claude(symbol: str, tech_signal: int, news_signal: int, df: pd.DataFrame) -> dict:
-    """
-    Llama a Claude API solo cuando 2+ señales alinean.
-    Devuelve dict con action, confidence, reasoning.
-    """
     last = df.iloc[-1]
     direction = "BULLISH" if tech_signal + news_signal > 0 else "BEARISH"
 
@@ -209,7 +201,7 @@ Respondé ÚNICAMENTE con este JSON (sin texto extra, sin backticks):
         "content-type": "application/json"
     }
     body = {
-        "model": "claude-haiku-4-5-20251001",   # modelo barato para esto
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 200,
         "messages": [{"role": "user", "content": prompt}]
     }
@@ -217,7 +209,6 @@ Respondé ÚNICAMENTE con este JSON (sin texto extra, sin backticks):
     try:
         resp = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=body, timeout=15)
         text = resp.json()["content"][0]["text"].strip()
-        # limpiar posibles backticks
         text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
@@ -229,32 +220,45 @@ Respondé ÚNICAMENTE con este JSON (sin texto extra, sin backticks):
 # GESTIÓN DE POSICIONES
 # ─────────────────────────────────────────
 def get_position_size(capital: float) -> float:
-    """Calcula tamaño de posición en USD."""
     return round(capital * RISK_PER_TRADE, 2)
 
 
 def execute_trade(exchange: ccxt.binance, symbol: str, action: str, capital: float):
-    """Ejecuta orden en Binance Testnet con stop-loss y take-profit."""
     try:
-        ticker    = exchange.fetch_ticker(symbol)
-        price     = ticker["last"]
-        usd_size  = get_position_size(capital)
-        qty       = usd_size / price
+        ticker   = exchange.fetch_ticker(symbol)
+        price    = ticker["last"]
+        usd_size = get_position_size(capital)
+        qty      = usd_size / price
 
         if action == "BUY":
-            order = exchange.create_market_buy_order(symbol, qty)
+            order    = exchange.create_market_buy_order(symbol, qty)
             sl_price = round(price * (1 - STOP_LOSS_PCT), 4)
             tp_price = round(price * (1 + TAKE_PROFIT_PCT), 4)
-            log.info(f"✅ COMPRA ejecutada: {symbol} | qty={qty:.6f} | precio={price} | SL={sl_price} | TP={tp_price}")
-
+            log.info(f"✅ COMPRA: {symbol} | qty={qty:.6f} | precio={price} | SL={sl_price} | TP={tp_price}")
+            send_telegram(
+                f"✅ <b>COMPRA ejecutada</b>\n"
+                f"Par: <b>{symbol}</b>\n"
+                f"Precio: <b>{price} USDT</b>\n"
+                f"Cantidad: {qty:.6f}\n"
+                f"Stop Loss: {sl_price}\n"
+                f"Take Profit: {tp_price}\n"
+                f"Capital usado: ${usd_size}"
+            )
         elif action == "SELL":
             order = exchange.create_market_sell_order(symbol, qty)
-            log.info(f"✅ VENTA ejecutada: {symbol} | qty={qty:.6f} | precio={price}")
+            log.info(f"✅ VENTA: {symbol} | qty={qty:.6f} | precio={price}")
+            send_telegram(
+                f"🔴 <b>VENTA ejecutada</b>\n"
+                f"Par: <b>{symbol}</b>\n"
+                f"Precio: <b>{price} USDT</b>\n"
+                f"Cantidad: {qty:.6f}"
+            )
 
         return order
 
     except Exception as e:
         log.error(f"Error ejecutando orden {action} en {symbol}: {e}")
+        send_telegram(f"⚠️ <b>Error en orden {action}</b>\nPar: {symbol}\nError: {e}")
         return None
 
 
@@ -264,7 +268,6 @@ def execute_trade(exchange: ccxt.binance, symbol: str, action: str, capital: flo
 TRADE_LOG_FILE = "trade_log.json"
 
 def save_trade(record: dict):
-    """Guarda cada operación en un archivo JSON local."""
     log_data = []
     if os.path.exists(TRADE_LOG_FILE):
         with open(TRADE_LOG_FILE, "r") as f:
@@ -281,6 +284,13 @@ def run():
     log.info("🤖 Bot iniciado — Binance Testnet")
     log.info(f"Capital: ${CAPITAL_TOTAL_USD} | Riesgo/op: {RISK_PER_TRADE*100}% | Watchlist: {WATCHLIST}")
 
+    send_telegram(
+        f"🤖 <b>Bot iniciado</b>\n"
+        f"Capital: ${CAPITAL_TOTAL_USD}\n"
+        f"Pares: {', '.join(WATCHLIST)}\n"
+        f"Ciclo: cada {LOOP_INTERVAL_SEC//60} minutos"
+    )
+
     exchange = get_exchange()
 
     while True:
@@ -290,30 +300,29 @@ def run():
         for symbol in WATCHLIST:
             try:
                 log.info(f"\n📊 Analizando {symbol}...")
-
-                # 1. Datos técnicos
-                df      = get_ohlcv(exchange, symbol)
-                df      = calculate_indicators(df)
-                t_sig   = technical_signal(df)
-
-                # 2. Sentimiento noticias
-                n_sig   = get_news_sentiment(symbol)
+                df    = get_ohlcv(exchange, symbol)
+                df    = calculate_indicators(df)
+                t_sig = technical_signal(df)
+                n_sig = get_news_sentiment(symbol)
 
                 log.info(f"  Señal técnica : {'+1 (BULL)' if t_sig==1 else '-1 (BEAR)' if t_sig==-1 else '0 (neutral)'}")
                 log.info(f"  Señal noticias: {'+1 (POS)' if n_sig==1 else '-1 (NEG)' if n_sig==-1 else '0 (neutral)'}")
 
-                # 3. Solo actuar si 2+ señales alinean
                 total_signals = t_sig + n_sig
                 if abs(total_signals) < MIN_SIGNALS:
                     log.info(f"  ⏭️  Señales insuficientes ({total_signals}) — skip")
                     continue
 
-                # 4. Consultar Claude para validación final
                 log.info(f"  🧠 Consultando Claude (señales alineadas: {total_signals})...")
-                analysis = ask_claude(symbol, t_sig, n_sig, df)
-                log.info(f"  Claude dice: {analysis['action']} (confianza: {analysis['confidence']}) — {analysis['reasoning']}")
+                send_telegram(
+                    f"🧠 <b>Señales alineadas en {symbol}</b>\n"
+                    f"Técnica: {'+1' if t_sig==1 else '-1'} | Noticias: {'+1' if n_sig==1 else '-1'}\n"
+                    f"Consultando Claude..."
+                )
 
-                # 5. Ejecutar si Claude confirma y confianza > 0.6
+                analysis = ask_claude(symbol, t_sig, n_sig, df)
+                log.info(f"  Claude: {analysis['action']} (confianza: {analysis['confidence']}) — {analysis['reasoning']}")
+
                 if analysis["action"] in ("BUY", "SELL") and analysis["confidence"] >= 0.6:
                     order = execute_trade(exchange, symbol, analysis["action"], CAPITAL_TOTAL_USD)
                     if order:
@@ -329,6 +338,11 @@ def run():
                         })
                 else:
                     log.info(f"  🚫 Claude no confirmó — HOLD")
+                    send_telegram(
+                        f"🚫 <b>HOLD en {symbol}</b>\n"
+                        f"Claude: {analysis['action']} (confianza: {analysis['confidence']})\n"
+                        f"{analysis['reasoning']}"
+                    )
 
             except Exception as e:
                 log.error(f"Error procesando {symbol}: {e}")
