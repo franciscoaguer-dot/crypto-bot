@@ -53,8 +53,8 @@ def get_exchange() -> ccxt.binance:
         "options": {"defaultType": "spot"},
         "urls": {
             "api": {
-                "public":  "https://testnet.binance.vision/api",
-                "private": "https://testnet.binance.vision/api",
+                "public":  "https://testnet.binance.vision/api/v3",
+                "private": "https://testnet.binance.vision/api/v3",
             }
         }
     })
