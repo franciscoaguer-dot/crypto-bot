@@ -115,35 +115,64 @@ def technical_signal(df: pd.DataFrame) -> int:
 
 
 # ─────────────────────────────────────────
-# SENTIMIENTO DE NOTICIAS (CryptoPanic RSS)
+# SENTIMIENTO DE NOTICIAS (RSS gratuito)
 # ─────────────────────────────────────────
-BULLISH_KEYWORDS = ["rally", "surge", "breakout", "bullish", "adoption", "partnership", "upgrade", "all-time high", "ath"]
-BEARISH_KEYWORDS = ["crash", "hack", "ban", "bearish", "lawsuit", "regulation", "sell-off", "collapse", "fear"]
+BULLISH_KEYWORDS = ["rally", "surge", "breakout", "bullish", "adoption", "partnership", "upgrade", "all-time high", "ath", "gains", "rises", "jumps", "soars", "recovery"]
+BEARISH_KEYWORDS = ["crash", "hack", "ban", "bearish", "lawsuit", "regulation", "sell-off", "collapse", "fear", "drops", "falls", "plunges", "warning", "risk"]
+
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+]
+
+COIN_NAMES = {
+    "btc": ["bitcoin", "btc"],
+    "eth": ["ethereum", "eth"],
+    "sol": ["solana", "sol"],
+    "bnb": ["bnb", "binance"],
+}
 
 def get_news_sentiment(symbol: str) -> int:
     """
-    Scrape CryptoPanic feed gratuito.
+    Lee RSS feeds gratuitos de CoinDesk y Cointelegraph.
+    Filtra por coin y analiza sentimiento por keywords.
     Retorna +1 / -1 / 0
     """
+    import re
     coin = symbol.split("/")[0].lower()
-    url  = f"https://cryptopanic.com/api/v1/posts/?auth_token=free&currencies={coin}&kind=news"
-    try:
-        resp  = requests.get(url, timeout=10)
-        data  = resp.json()
-        posts = data.get("results", [])[:10]  # últimas 10 noticias
-        titles = " ".join([p.get("title", "").lower() for p in posts])
+    search_terms = COIN_NAMES.get(coin, [coin])
 
-        bull_count = sum(1 for kw in BULLISH_KEYWORDS if kw in titles)
-        bear_count = sum(1 for kw in BEARISH_KEYWORDS if kw in titles)
+    all_titles = []
+    for feed_url in RSS_FEEDS:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            resp = requests.get(feed_url, timeout=10, headers=headers)
+            titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", resp.text)
+            if not titles:
+                titles = re.findall(r"<title>(.*?)</title>", resp.text)
+            all_titles.extend(titles[:15])
+        except Exception as e:
+            log.warning(f"RSS feed error ({feed_url}): {e}")
+            continue
 
-        if bull_count > bear_count:
-            return +1
-        if bear_count > bull_count:
-            return -1
+    if not all_titles:
         return 0
-    except Exception as e:
-        log.warning(f"News sentiment error para {symbol}: {e}")
-        return 0
+
+    relevant = [t.lower() for t in all_titles if any(term in t.lower() for term in search_terms)]
+    if not relevant:
+        relevant = [t.lower() for t in all_titles]
+
+    titles_text = " ".join(relevant)
+    bull_count = sum(1 for kw in BULLISH_KEYWORDS if kw in titles_text)
+    bear_count = sum(1 for kw in BEARISH_KEYWORDS if kw in titles_text)
+
+    log.info(f"  Noticias relevantes: {len(relevant)} | bull={bull_count} bear={bear_count}")
+
+    if bull_count > bear_count:
+        return +1
+    if bear_count > bull_count:
+        return -1
+    return 0
 
 
 # ─────────────────────────────────────────
