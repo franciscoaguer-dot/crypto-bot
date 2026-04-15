@@ -1,5 +1,5 @@
 """
-CryptoBot v7 — Full Featured
+CryptoBot v8 — High Win Rate Edition
 - Noticias neutral por defecto (fix)
 - RSI Divergence
 - Bollinger Bands
@@ -31,6 +31,10 @@ from flask import Flask, jsonify, render_template_string
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
+
+# Claude rate limiter — evita errores por demasiadas llamadas simultáneas
+_claude_semaphore  = threading.Semaphore(1)
+_claude_last_call  = 0
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -78,8 +82,17 @@ BB_PERIOD = 20
 BB_STD    = 2.0
 
 # Market Regime
-REGIME_TREND_THRESHOLD  = 0.02   # diferencia EMA50/EMA200 > 2% = tendencia
-REGIME_CRASH_THRESHOLD  = -0.05  # caída >5% en 24h = crash
+REGIME_TREND_THRESHOLD  = 0.02
+REGIME_CRASH_THRESHOLD  = -0.05
+
+# v8 — High Win Rate
+STOP_LOSS_PCT           = 0.03   # stop loss absoluto 3% desde entrada
+MIN_SIGNALS_SIDEWAYS    = 3      # score mínimo en sideways (más estricto)
+PROFIT_TRAIL_TRIGGER    = 0.015  # cuando ganancia >1.5%, ajustar TP hacia arriba
+PROFIT_TRAIL_STEP       = 0.010  # subir TP en 1% cada vez
+MAX_CORRELATION_ALTS    = 3      # máximo 3 altcoins abiertas simultáneamente
+CLAUDE_RATE_LIMIT_SEC   = 2      # segundos mínimos entre llamadas a Claude
+CLAUDE_MAX_RETRIES      = 3      # reintentos con backoff
 
 # Archivos
 TRADE_LOG_FILE    = "trade_log.json"
@@ -168,7 +181,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CryptoBot v7</title>
+<title>CryptoBot v8</title>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
   :root{--bg:#080c10;--surface:#0d1117;--border:#1a2332;--green:#00ff88;--red:#ff3355;--yellow:#ffcc00;--blue:#00aaff;--orange:#ff9900;--purple:#aa55ff;--muted:#3d5166;--text:#c9d8e8;--mono:'Share Tech Mono',monospace;--sans:'Syne',sans-serif}
@@ -247,7 +260,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <div class="container">
   <header>
-    <div class="logo">Crypto<span>Bot</span><small>v7</small></div>
+    <div class="logo">Crypto<span>Bot</span><small>v8</small></div>
     <div class="badges">
       <div class="pill pill-paper" id="mode-pill"><div class="dot"></div><span id="mode-text">PAPER</span></div>
       <div class="pill pill-live" id="drawdown-pill" style="display:none"><div class="dot"></div>⚠️ DRAWDOWN</div>
@@ -282,7 +295,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <tbody id="trades-body"></tbody>
     </table>
   </div>
-  <footer>CryptoBot v7 · RSI Div · BB · Order Book · Regime · Compounding · Anti-Drawdown</footer>
+  <footer>CryptoBot v8 · Stop Loss · Profit Trail · Rate Limit · Sideways Filter · Correlación</footer>
 </div>
 <script>
 let countdown=30;
@@ -1002,6 +1015,30 @@ def update_trailing_stops(public_ex, state):
                     pos["trail_stop"] = round(current * (1 - trail_pct), 4)
                     log.info(f"  📈 Trail {symbol}: {pos['trail_stop']}")
 
+                # Stop loss absoluto — cerrar si cae >3% desde entrada
+                stop_loss_price = pos["entry_price"] * (1 - STOP_LOSS_PCT)
+                if current <= stop_loss_price and current < pos["entry_price"]:
+                    pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    log.info(f"  🛑 STOP LOSS {symbol} @ {current} | PnL: {pnl:.2f}%")
+                    pnl_usd = pnl * pos["usd_size"] / 100
+                    update_compounding(state, pnl_usd)
+                    send_telegram(f"🛑 <b>Stop Loss</b> — {symbol}\nEntrada: {pos['entry_price']} → Salida: {current}\nPnL: {pnl:+.2f}% ❌")
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action":"SELL","price":current,"timeframe":pos.get("timeframe","1h"),
+                        "mode":pos.get("mode","SPOT"),"reasoning":f"Stop loss -3% (entrada {pos['entry_price']})",
+                        "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
+                        "trail_triggered":False,"stop_loss":True,
+                        "entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                    closed.append(symbol); continue
+
+                # Profit trailing dinámico — subir TP cuando ganancia >1.5%
+                unrealized_pct = (current - pos["entry_price"]) / pos["entry_price"]
+                if unrealized_pct >= PROFIT_TRAIL_TRIGGER:
+                    new_tp = round(current * (1 + PROFIT_TRAIL_STEP), 4)
+                    if new_tp > pos["take_profit"]:
+                        pos["take_profit"] = new_tp
+                        log.info(f"  🎯 TP subido {symbol}: {new_tp} (+{unrealized_pct*100:.1f}% ganancia)")
+
                 if current <= pos["trail_stop"]:
                     pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
                     log.info(f"  🔴 TRAIL STOP {symbol} @ {current} | PnL: {pnl:.2f}%")
@@ -1034,13 +1071,13 @@ def update_trailing_stops(public_ex, state):
     save_positions(positions)
 
 # ─────────────────────────────────────────
-# CLAUDE
+# CLAUDE — con rate limiter + retry + backoff
 # ─────────────────────────────────────────
 def ask_claude(symbol, signals, df, fg_value, usd_size, pct, timeframe, regime):
+    global _claude_last_call
     last  = df.iloc[-1]
     total = sum(v for k,v in signals.items() if k != "rsi_div_val")
-    direction = "BULLISH" if total > 0 else "BEARISH"
-    rsi_div_info = "Sí (señal fuerte)" if signals.get("rsi_div_val") else "No"
+    rsi_div_info = "YES (strong)" if signals.get("rsi_div_val") else "No"
 
     prompt = f"""Trading crypto analyst. Respond ONLY in JSON, no backticks.
 
@@ -1050,20 +1087,37 @@ MACD hist: {last['macd_hist']:.4f} | BB: {last['bb_lower']:.4f}/{last['bb_mid']:
 Vol/MA20: {last['volume']:.0f}/{last['vol_ma20']:.0f} | Fear&Greed: {fg_value}
 
 Signals: EMA:{signals.get('tech',0):+d} MACD:{signals.get('macd',0):+d} RSI_DIV:{rsi_div_info} BB:{signals.get('bb',0):+d} OB:{signals.get('ob',0):+d} VOL:{signals.get('vol',0):+d} FR:{signals.get('funding',0):+d} NEWS:{signals.get('news',0):+d}
-Total: {total:+d} | Size: ${usd_size} ({pct*100:.0f}%) | Trail: {FUTURES_TRAILING*100 if 'FUT' in str(signals) else TRAILING_STOP_PCT*100}%
+Total: {total:+d} | Size: ${usd_size} ({pct*100:.0f}%) | StopLoss: {STOP_LOSS_PCT*100}% | Trail: {FUTURES_TRAILING*100 if 'FUT' in str(signals) else TRAILING_STOP_PCT*100}%
 
 {{"action":"BUY"|"SELL"|"HOLD","confidence":0.0,"reasoning":"one concise line"}}"""
 
-    try:
-        resp = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-haiku-4-5-20251001","max_tokens":200,"messages":[{"role":"user","content":prompt}]},
-            timeout=15)
-        text = resp.json()["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
-        return json.loads(text)
-    except Exception as e:
-        log.error(f"Claude error: {e}")
-        return {"action":"HOLD","confidence":0,"reasoning":"API error"}
+    with _claude_semaphore:
+        # Rate limit — esperar mínimo entre llamadas
+        now = time.time()
+        wait = CLAUDE_RATE_LIMIT_SEC - (now - _claude_last_call)
+        if wait > 0:
+            time.sleep(wait)
+
+        for attempt in range(CLAUDE_MAX_RETRIES):
+            try:
+                resp = requests.post("https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                    json={"model":"claude-haiku-4-5-20251001","max_tokens":200,"messages":[{"role":"user","content":prompt}]},
+                    timeout=20)
+                _claude_last_call = time.time()
+                data = resp.json()
+                if "content" not in data:
+                    raise ValueError(f"No content in response: {data.get('error', data)}")
+                text = data["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
+                return json.loads(text)
+            except Exception as e:
+                backoff = 2 ** attempt  # 1s, 2s, 4s
+                log.warning(f"Claude attempt {attempt+1}/{CLAUDE_MAX_RETRIES} failed: {e} — retry in {backoff}s")
+                if attempt < CLAUDE_MAX_RETRIES - 1:
+                    time.sleep(backoff)
+
+        log.error(f"Claude failed after {CLAUDE_MAX_RETRIES} attempts")
+        return {"action":"HOLD","confidence":0,"reasoning":"API unavailable"}
 
 # ─────────────────────────────────────────
 # ÓRDENES
@@ -1126,12 +1180,21 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex, fg_val
 
     log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} BB:{bb_sig:+d} OB:{ob_sig:+d} RSIDiv:{rsi_sig:+d} VOL:{v_sig:+d} FR:{fr_sig:+d} NEWS:{n_sig:+d} = {total:+d}")
 
-    if abs(total) < MIN_SIGNALS:
-        log.info("  ⏭️  Señales insuficientes — skip")
+    # Score mínimo dinámico según régimen
+    min_score = MIN_SIGNALS_SIDEWAYS if regime == "sideways" else MIN_SIGNALS
+    if abs(total) < min_score:
+        log.info(f"  ⏭️  Score {total:+d} < mínimo {min_score} ({regime}) — skip")
         return
 
     if timeframe == "3m" and total < 0:
         log.info("  ⏭️  Bajista en 3m — solo long en altcoins")
+        return
+
+    # Correlación — máximo 3 altcoins abiertas simultáneamente
+    base_symbols = set(BASE_WATCHLIST)
+    open_alts = [s for s in open_positions if s not in base_symbols]
+    if symbol not in base_symbols and len(open_alts) >= MAX_CORRELATION_ALTS:
+        log.info(f"  ⏭️  Correlación: ya hay {len(open_alts)} altcoins abiertas ({MAX_CORRELATION_ALTS} máx)")
         return
 
     effective_cap = get_effective_capital(state)
@@ -1207,17 +1270,18 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex, fg_val
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v7 iniciado")
+    log.info("🤖 CryptoBot v8 iniciado — High Win Rate Edition")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v7 iniciado</b>\n"
+        f"🤖 <b>CryptoBot v8 iniciado</b> — High Win Rate\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
         f"Señales: EMA+MACD+RSI_Div+BB+OB+Funding+Noticias\n"
         f"Spot: Trail {TRAILING_STOP_PCT*100}% | TP {TAKE_PROFIT_PCT*100}%\n"
         f"Futuros {FUTURES_LEVERAGE}x (score≥{FUTURES_MIN_SCORE}): Trail {FUTURES_TRAILING*100}%\n"
-        f"Anti-drawdown: {MAX_WEEKLY_LOSS_PCT*100}% | Compounding: ON\n"
-        f"Resumen diario: 9 AM | Backtest: domingos 10 AM"
+        f"Stop Loss: {STOP_LOSS_PCT*100}% | Profit Trail: +{PROFIT_TRAIL_TRIGGER*100}%\n"
+        f"Anti-drawdown: {MAX_WEEKLY_LOSS_PCT*100}% | Correlación máx: {MAX_CORRELATION_ALTS} alts\n"
+        f"Sideways min score: {MIN_SIGNALS_SIDEWAYS} | Claude rate limit: {CLAUDE_RATE_LIMIT_SEC}s"
     )
 
     public_ex  = get_public_exchange()
