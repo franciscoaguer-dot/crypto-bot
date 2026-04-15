@@ -1,7 +1,9 @@
 """
-CryptoBot v4
+CryptoBot v5
 - BTC/ETH/SOL/BNB en 1h (base)
-- Top altcoins por volumen en 15m (dinámicas)
+- Top altcoins por volumen en 3m (scalping)
+- Funding Rates — señal de posicionamiento del mercado
+- Capital Allocator — máximo 15% capital en posiciones abiertas
 - Trailing stop + position sizing dinámico
 - Resumen diario a las 9 AM (Argentina)
 - Paper trading mode
@@ -42,14 +44,30 @@ LOOP_INTERVAL_SEC  = 60     # loop cada 1 minuto
 TRADE_LOG_FILE     = "trade_log.json"
 POSITIONS_FILE     = "positions.json"
 
+# Capital Allocator
+MAX_CAPITAL_EXPOSURE = 0.15   # máximo 15% del capital en posiciones abiertas
+
+# Funding Rate thresholds
+FUNDING_BULLISH_THRESHOLD  = -0.0001  # funding negativo → oportunidad compra
+FUNDING_BEARISH_THRESHOLD  =  0.0010  # funding muy positivo → evitar compras
+
 # Watchlist base — siempre monitoreada en 1h
 BASE_WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 
 # Stablecoins y tokens a excluir del scanner
 EXCLUDE_SYMBOLS = {
-    "USDT","USDC","BUSD","DAI","TUSD","FDUSD","USDP",
-    "WBTC","WETH","STETH","BETH","BTC","ETH","SOL","BNB"
+    "USDT","USDC","BUSD","DAI","TUSD","FDUSD","USDP","USD1",
+    "WBTC","WETH","STETH","BETH","BTC","ETH","SOL","BNB",
+    "LDUSDT","XAUT","PAXG"  # gold tokens — muy illiquidos para scalping
 }
+
+# Solo altcoins con nombre ASCII (filtra tokens basura con caracteres chinos/especiales)
+def is_valid_symbol(symbol):
+    base = symbol.replace("/USDT", "")
+    if not base.isascii(): return False           # excluir caracteres no ASCII
+    if len(base) > 10: return False               # nombres muy largos = tokens raros
+    if any(c in base for c in ["1","2","3"] if base.endswith(c)): pass  # ok
+    return True
 
 # Timezone Argentina (UTC-3)
 ARG_TZ = timezone(timedelta(hours=-3))
@@ -159,6 +177,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="stat-card" style="--accent:var(--blue)"><div class="stat-label">Fear & Greed</div><div class="stat-value blue" id="fg-val">—</div><div class="stat-sub" id="fg-lbl">—</div></div>
     <div class="stat-card" style="--accent:var(--orange)"><div class="stat-label">Posiciones</div><div class="stat-value orange" id="open-pos">—</div><div class="stat-sub">abiertas</div></div>
     <div class="stat-card" style="--accent:var(--purple)"><div class="stat-label">Altcoins</div><div class="stat-value purple" id="altcount">—</div><div class="stat-sub">en scanner</div></div>
+    <div class="stat-card" style="--accent:var(--orange)"><div class="stat-label">Capital usado</div><div class="stat-value orange" id="cap-used">—</div><div class="stat-sub">de $15 máx</div></div>
   </div>
 
   <div class="scanner-section">
@@ -200,6 +219,15 @@ async function loadData(){
     const pnlEl=document.getElementById('pnl');
     pnlEl.textContent=(totalPnl>=0?'+':'')+'$'+totalPnl.toFixed(2);
     pnlEl.className='stat-value '+(totalPnl>=0?'green':'red');
+
+    // Capital exposure
+    const positions2=data.positions||[];
+    const allocated=positions2.reduce((s,p)=>s+(p.usd_size||0),0);
+    const capEl=document.getElementById('cap-used');
+    if(capEl){
+      capEl.textContent='$'+allocated.toFixed(1);
+      capEl.className='stat-value '+(allocated>=15?'red':allocated>=10?'yellow':'green');
+    }
 
     if(data.fear_greed){
       const fg=data.fear_greed;
@@ -420,8 +448,9 @@ def scan_top_altcoins(exchange, max_alts=8):
             if not symbol.endswith("/USDT"): continue
             base = symbol.replace("/USDT", "")
             if base in EXCLUDE_SYMBOLS: continue
+            if not is_valid_symbol(symbol): continue   # filtrar tokens basura
             vol = t.get("quoteVolume") or 0
-            if vol < 5_000_000: continue  # mínimo $5M de volumen
+            if vol < 20_000_000: continue  # mínimo $20M de volumen (más estricto)
             usdt_pairs.append({"symbol": symbol, "volume": vol})
 
         usdt_pairs.sort(key=lambda x: x["volume"], reverse=True)
@@ -646,6 +675,7 @@ MACD hist: {last['macd_hist']:.4f} | Vol/MA20: {last['volume']:.0f}/{last['vol_m
 Fear&Greed: {fg_value} | Timeframe: {timeframe}
 Signals (EMA:{signals['tech']:+d} MACD:{signals['macd']:+d} VOL:{signals['vol']:+d} CONF:{signals['tf4h']:+d} NEWS:{signals['news']:+d}) = {total:+d}
 Position: ${usd_size} ({pct*100:.0f}%) | Trail: {TRAILING_STOP_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%
+Funding rate: {signals.get("funding", 0):+d} (positivo=longs sobrecargados, negativo=oportunidad)
 
 {{"action":"BUY"|"SELL"|"HOLD","confidence":0.0,"reasoning":"one line"}}"""
     try:
@@ -680,6 +710,90 @@ def save_trade(record):
     data.append(record)
     with open(TRADE_LOG_FILE,"w") as f: json.dump(data, f, indent=2, default=str)
 
+
+# ─────────────────────────────────────────
+# FUNDING RATES
+# ─────────────────────────────────────────
+_funding_cache = {}
+_funding_last_fetch = 0
+
+def get_funding_rate(symbol):
+    """
+    Obtiene el funding rate de Binance Futuros para un par.
+    Positivo = longs pagan a shorts (mercado sobrecargado de longs)
+    Negativo = shorts pagan a longs (oportunidad de compra)
+    Cache de 15 minutos para no sobrecargar la API.
+    """
+    global _funding_cache, _funding_last_fetch
+    now = time.time()
+
+    # Refrescar cache cada 15 minutos
+    if now - _funding_last_fetch > 900:
+        try:
+            url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+            resp = requests.get(url, timeout=10)
+            data = resp.json()
+            _funding_cache = {
+                item["symbol"]: float(item.get("lastFundingRate", 0))
+                for item in data
+            }
+            _funding_last_fetch = now
+            log.info(f"  💹 Funding rates actualizados ({len(_funding_cache)} pares)")
+        except Exception as e:
+            log.warning(f"Funding rate fetch error: {e}")
+            return 0.0
+
+    # Buscar el símbolo (BTCUSDT, ETHUSDT, etc.)
+    futures_symbol = symbol.replace("/", "")
+    rate = _funding_cache.get(futures_symbol, None)
+    if rate is None:
+        return 0.0
+    return rate
+
+def funding_rate_signal(symbol):
+    """
+    Retorna señal basada en funding rate:
+    +1 = funding negativo → shorts pagando → buen momento para comprar
+     0 = neutral
+    -1 = funding muy positivo → longs sobrecargados → evitar compras
+    """
+    rate = get_funding_rate(symbol)
+    if rate == 0.0:
+        return 0, rate
+
+    if rate <= FUNDING_BULLISH_THRESHOLD:
+        log.info(f"  💹 Funding: {rate:.4%} → BULLISH (shorts pagando)")
+        return +1, rate
+    elif rate >= FUNDING_BEARISH_THRESHOLD:
+        log.info(f"  💹 Funding: {rate:.4%} → BEARISH (mercado sobrecargado)")
+        return -1, rate
+    else:
+        log.info(f"  💹 Funding: {rate:.4%} → neutral")
+        return 0, rate
+
+# ─────────────────────────────────────────
+# CAPITAL ALLOCATOR
+# ─────────────────────────────────────────
+def get_allocated_capital(positions):
+    """Calcula cuánto capital está actualmente en posiciones abiertas."""
+    return sum(p.get("usd_size", 0) for p in positions.values())
+
+def can_open_position(positions, new_size):
+    """
+    Verifica si hay capital disponible para abrir una nueva posición.
+    Límite: MAX_CAPITAL_EXPOSURE % del capital total.
+    """
+    allocated    = get_allocated_capital(positions)
+    max_allowed  = CAPITAL_TOTAL_USD * MAX_CAPITAL_EXPOSURE
+    available    = max_allowed - allocated
+
+    log.info(f"  💼 Capital: ${allocated:.2f} usado / ${max_allowed:.2f} máx (${available:.2f} disp)")
+
+    if new_size > available:
+        log.info(f"  🚫 Capital insuficiente: necesita ${new_size} pero solo ${available:.2f} disponible")
+        return False
+    return True
+
 # ─────────────────────────────────────────
 # ANALIZAR UN PAR
 # ─────────────────────────────────────────
@@ -696,16 +810,30 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label
     h_sig = timeframe_confirm_signal(public_ex, symbol, timeframe)
     n_sig = get_news_sentiment(symbol)
 
-    signals = {"tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig, "news": n_sig}
+    # Funding rate — señal de posicionamiento
+    fr_sig, fr_value = funding_rate_signal(symbol)
+
+    signals = {"tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig, "news": n_sig, "funding": fr_sig}
     total   = sum(signals.values())
 
-    log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} VOL:{v_sig:+d} CONF:{h_sig:+d} NEWS:{n_sig:+d} = {total:+d}")
+    log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} VOL:{v_sig:+d} CONF:{h_sig:+d} NEWS:{n_sig:+d} FR:{fr_sig:+d} = {total:+d}")
 
     if abs(total) < MIN_SIGNALS:
         log.info("  ⏭️  Señales insuficientes — skip")
         return
 
+    # Para altcoins en 3m solo buscar compras (scalping long)
+    if timeframe == "3m" and total < 0:
+        log.info("  ⏭️  Señal bajista en 3m — solo long en altcoins")
+        return
+
     usd_size, risk_pct = get_position_size(CAPITAL_TOTAL_USD, total)
+
+    # Capital Allocator — verificar que hay capital disponible
+    if not can_open_position(open_positions, usd_size):
+        send_telegram(f"💼 <b>Capital límite alcanzado</b>\nNo se puede abrir {symbol} — máximo {MAX_CAPITAL_EXPOSURE*100:.0f}% expuesto")
+        return
+
     log.info("  🧠 Consultando Claude...")
     analysis = ask_claude(symbol, signals, df, fg_value, usd_size, risk_pct, timeframe)
     log.info(f"  Claude: {analysis['action']} ({analysis['confidence']:.2f}) — {analysis['reasoning']}")
@@ -719,6 +847,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label
         "reasoning": analysis["reasoning"], "timeframe": timeframe,
         "tech_signal": t_sig, "macd_signal": m_sig, "vol_signal": v_sig,
         "tf4h_signal": h_sig, "news_signal": n_sig,
+        "funding_signal": fr_sig, "funding_rate": round(fr_value * 100, 4),
         "fear_greed_value": fg_value, "fear_greed_label": fg_label,
         "price": current_price, "usd_size": usd_size, "risk_pct": risk_pct,
         "signal_score": total,
@@ -731,12 +860,16 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label
             save_trade({**base_record, "paper": True, "order_id": None})
             open_position(symbol, current_price, usd_size, risk_pct, "BUY", timeframe)
             log.info(f"  📝 PAPER BUY @ {current_price} | Trail={trail_stop} TP={take_profit}")
+            fr_val = round(fr_value * 100, 4) if "fr_value" in dir() else 0
+            allocated_now = get_allocated_capital(open_positions)
             send_telegram(
                 f"📝 <b>PAPER BUY [{timeframe}]</b>\n"
                 f"Par: <b>{symbol}</b> @ {current_price}\n"
                 f"🔴 Trail: {trail_stop} | 🎯 TP: {take_profit}\n"
                 f"💰 ${usd_size} ({risk_pct*100:.0f}% — score {total:+d})\n"
-                f"Confianza: {int(analysis['confidence']*100)}% | F&G: {fg_value}"
+                f"💹 Funding: {fr_sig:+d} | F&G: {fg_value}\n"
+                f"💼 Capital usado: ${allocated_now:.1f}/${CAPITAL_TOTAL_USD*MAX_CAPITAL_EXPOSURE:.0f}\n"
+                f"Confianza: {int(analysis['confidence']*100)}%"
             )
         else:
             order, exec_price = execute_trade(trade_ex, symbol, "BUY", usd_size)
@@ -759,12 +892,12 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v4 iniciado")
+    log.info("🤖 CryptoBot v5 iniciado — Funding Rates + Capital Allocator")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     log.info(f"Base: {BASE_WATCHLIST} [1h] + Top altcoins [3m scalping]")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v4 iniciado</b>\n"
+        f"🤖 <b>CryptoBot v5 iniciado</b>\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
         f"Base 1h: {', '.join(s.replace('/USDT','') for s in BASE_WATCHLIST)}\n"
         f"+ Top altcoins 3m (scalping)\n"
