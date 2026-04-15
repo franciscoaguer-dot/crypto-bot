@@ -1,5 +1,5 @@
 """
-CryptoBot v5
+CryptoBot v6
 - BTC/ETH/SOL/BNB en 1h (base)
 - Top altcoins por volumen en 3m (scalping)
 - Funding Rates — señal de posicionamiento del mercado
@@ -37,19 +37,26 @@ CAPITAL_TOTAL_USD  = float(os.environ.get("CAPITAL_USD", "100"))
 PAPER_TRADING      = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 
 POSITION_SIZE_MAP  = {2: 0.02, 3: 0.03, 4: 0.04, 5: 0.05}
-TRAILING_STOP_PCT  = 0.010   # scalping: 1%
-TAKE_PROFIT_PCT    = 0.025   # scalping: 2.5%
+TRAILING_STOP_PCT  = 0.010   # spot scalping: 1%
+TAKE_PROFIT_PCT    = 0.025   # spot: 2.5%
+FUTURES_TRAILING   = 0.008   # futuros: 0.8% (más ajustado)
+FUTURES_TP         = 0.020   # futuros: 2%
 MIN_SIGNALS        = 2
-LOOP_INTERVAL_SEC  = 60     # loop cada 1 minuto
+CONFIDENCE_MIN     = 0.50    # confianza mínima para ejecutar
+LOOP_INTERVAL_SEC  = 60
 TRADE_LOG_FILE     = "trade_log.json"
 POSITIONS_FILE     = "positions.json"
 
 # Capital Allocator
-MAX_CAPITAL_EXPOSURE = 0.15   # máximo 15% del capital en posiciones abiertas
+MAX_CAPITAL_EXPOSURE = 0.20   # máximo 20% del capital en posiciones abiertas
+
+# Futuros — solo cuando señal es fuerte
+FUTURES_MIN_SCORE  = 4        # score mínimo para operar futuros
+FUTURES_LEVERAGE   = 2        # apalancamiento 2x (conservador)
 
 # Funding Rate thresholds
-FUNDING_BULLISH_THRESHOLD  = -0.0001  # funding negativo → oportunidad compra
-FUNDING_BEARISH_THRESHOLD  =  0.0010  # funding muy positivo → evitar compras
+FUNDING_BULLISH_THRESHOLD  = -0.0001
+FUNDING_BEARISH_THRESHOLD  =  0.0015
 
 # Watchlist base — siempre monitoreada en 1h
 BASE_WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
@@ -435,6 +442,18 @@ def get_trade_exchange():
         }}
     })
 
+def get_futures_exchange():
+    """Binance Futures (testnet) — para trades con apalancamiento."""
+    return ccxt.binance({
+        "apiKey": BINANCE_API_KEY, "secret": BINANCE_API_SECRET,
+        "enableRateLimit": True,
+        "options": {"defaultType": "future"},
+        "urls": {"api": {
+            "public":  "https://testnet.binancefuture.com",
+            "private": "https://testnet.binancefuture.com",
+        }}
+    })
+
 # ─────────────────────────────────────────
 # ALTCOIN SCANNER — top por volumen 24h
 # ─────────────────────────────────────────
@@ -627,8 +646,8 @@ def get_fear_greed():
         return 50, "Neutral"
 
 def fear_greed_filter(value, action):
-    if action == "BUY"  and value < 25: return False
-    if action == "SELL" and value > 75: return False
+    if action == "BUY"  and value < 15: return False  # solo bloquear Extreme Fear severo
+    if action == "SELL" and value > 85: return False
     return True
 
 # ─────────────────────────────────────────
@@ -701,6 +720,33 @@ def execute_trade(trade_exchange, symbol, action, usd_size):
     except Exception as e:
         log.error(f"Error orden {action} {symbol}: {e}")
         send_telegram(f"⚠️ Error orden {action} {symbol}\n{e}")
+        return None, None
+
+
+# ─────────────────────────────────────────
+# FUTUROS — EJECUTAR CON APALANCAMIENTO
+# ─────────────────────────────────────────
+def execute_futures_trade(futures_ex, symbol, action, usd_size, leverage=FUTURES_LEVERAGE):
+    """Ejecuta orden en futuros con apalancamiento."""
+    try:
+        if PAPER_TRADING:
+            price = futures_ex.fetch_ticker(symbol)["last"] if futures_ex else 0
+            return None, price
+        # Set leverage
+        try:
+            futures_ex.set_leverage(leverage, symbol)
+        except Exception:
+            pass  # algunos pares no soportan set_leverage directo
+        price    = futures_ex.fetch_ticker(symbol)["last"]
+        notional = usd_size * leverage
+        qty      = notional / price
+        if action == "BUY":
+            order = futures_ex.create_market_buy_order(symbol, qty, {"reduceOnly": False})
+        elif action == "SELL":
+            order = futures_ex.create_market_sell_order(symbol, qty, {"reduceOnly": False})
+        return order, price
+    except Exception as e:
+        log.error(f"Error futuros {action} {symbol}: {e}")
         return None, None
 
 def save_trade(record):
@@ -797,8 +843,11 @@ def can_open_position(positions, new_size):
 # ─────────────────────────────────────────
 # ANALIZAR UN PAR
 # ─────────────────────────────────────────
-def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label, open_positions):
-    """Analiza un par y ejecuta/registra trade si hay señal."""
+def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex, fg_value, fg_label, open_positions):
+    """Analiza un par y ejecuta/registra trade si hay señal.
+    Score 2-3: spot sin apalancamiento
+    Score 4-5: futuros con 2x
+    """
     if symbol in open_positions:
         log.info(f"  {symbol}: posición ya abierta — skip")
         return
@@ -853,33 +902,50 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label
         "signal_score": total,
     }
 
-    if analysis["action"] == "BUY" and analysis["confidence"] >= 0.6:
-        trail_stop  = round(current_price * (1 - TRAILING_STOP_PCT), 4)
-        take_profit = round(current_price * (1 + TAKE_PROFIT_PCT), 4)
+    if analysis["action"] == "BUY" and analysis["confidence"] >= CONFIDENCE_MIN:
+        # Decidir spot vs futuros según score
+        use_futures   = (abs(total) >= FUTURES_MIN_SCORE) and (fg_value >= 20)
+        trail_pct     = FUTURES_TRAILING if use_futures else TRAILING_STOP_PCT
+        tp_pct        = FUTURES_TP       if use_futures else TAKE_PROFIT_PCT
+        leverage      = FUTURES_LEVERAGE if use_futures else 1
+        trail_stop    = round(current_price * (1 - trail_pct), 4)
+        take_profit   = round(current_price * (1 + tp_pct), 4)
+        mode_label    = f"FUTURES {leverage}x" if use_futures else "SPOT"
+
+        log.info(f"  Mode: {mode_label} | Trail={trail_pct*100}% TP={tp_pct*100}%")
+
         if PAPER_TRADING:
-            save_trade({**base_record, "paper": True, "order_id": None})
+            save_trade({**base_record, "paper": True, "order_id": None,
+                "mode": mode_label, "leverage": leverage,
+                "trail_stop": trail_stop, "take_profit": take_profit})
             open_position(symbol, current_price, usd_size, risk_pct, "BUY", timeframe)
-            log.info(f"  📝 PAPER BUY @ {current_price} | Trail={trail_stop} TP={take_profit}")
-            fr_val = round(fr_value * 100, 4) if "fr_value" in dir() else 0
+            log.info(f"  📝 PAPER {mode_label} BUY @ {current_price} | Trail={trail_stop} TP={take_profit}")
             allocated_now = get_allocated_capital(open_positions)
             send_telegram(
-                f"📝 <b>PAPER BUY [{timeframe}]</b>\n"
+                f"📝 <b>PAPER {mode_label} BUY [{timeframe}]</b>\n"
                 f"Par: <b>{symbol}</b> @ {current_price}\n"
                 f"🔴 Trail: {trail_stop} | 🎯 TP: {take_profit}\n"
-                f"💰 ${usd_size} ({risk_pct*100:.0f}% — score {total:+d})\n"
-                f"💹 Funding: {fr_sig:+d} | F&G: {fg_value}\n"
-                f"💼 Capital usado: ${allocated_now:.1f}/${CAPITAL_TOTAL_USD*MAX_CAPITAL_EXPOSURE:.0f}\n"
+                f"💰 ${usd_size}×{leverage} = ${usd_size*leverage:.0f} ({risk_pct*100:.0f}% — score {total:+d})\n"
+                f"💹 FR: {fr_sig:+d} | F&G: {fg_value}\n"
+                f"💼 Capital: ${allocated_now:.1f}/${CAPITAL_TOTAL_USD*MAX_CAPITAL_EXPOSURE:.0f}\n"
                 f"Confianza: {int(analysis['confidence']*100)}%"
             )
         else:
-            order, exec_price = execute_trade(trade_ex, symbol, "BUY", usd_size)
+            if use_futures:
+                order, exec_price = execute_futures_trade(futures_ex, symbol, "BUY", usd_size)
+            else:
+                order, exec_price = execute_trade(trade_ex, symbol, "BUY", usd_size)
             if order:
                 actual = exec_price or current_price
-                save_trade({**base_record, "paper": False, "order_id": order.get("id"), "price": actual})
+                save_trade({**base_record, "paper": False, "order_id": order.get("id"),
+                    "price": actual, "mode": mode_label, "leverage": leverage})
                 open_position(symbol, actual, usd_size, risk_pct, "BUY", timeframe)
-                send_telegram(f"✅ <b>COMPRA [{timeframe}]</b> — {symbol} @ {actual}\n💰 ${usd_size} | Trail: {round(actual*(1-TRAILING_STOP_PCT),4)}")
+                send_telegram(
+                    f"{'🚀' if use_futures else '✅'} <b>{mode_label} [{timeframe}]</b> — {symbol} @ {actual}\n"
+                    f"💰 ${usd_size}×{leverage} | Trail: {round(actual*(1-trail_pct),4)}"
+                )
 
-    elif analysis["action"] == "SELL" and analysis["confidence"] >= 0.6:
+    elif analysis["action"] == "SELL" and analysis["confidence"] >= CONFIDENCE_MIN:
         if PAPER_TRADING:
             save_trade({**base_record, "paper": True, "order_id": None})
             log.info(f"  📝 PAPER SELL @ {current_price}")
@@ -892,22 +958,26 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v5 iniciado — Funding Rates + Capital Allocator")
+    log.info("🤖 CryptoBot v6 iniciado — Spot + Futuros 2x + 15 Altcoins")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     log.info(f"Base: {BASE_WATCHLIST} [1h] + Top altcoins [3m scalping]")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v5 iniciado</b>\n"
+        f"🤖 <b>CryptoBot v6 iniciado</b>\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
         f"Base 1h: {', '.join(s.replace('/USDT','') for s in BASE_WATCHLIST)}\n"
         f"+ Top altcoins 3m (scalping)\n"
-        f"Trailing: {TRAILING_STOP_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}% | Resumen: 9 AM"
+        f"Spot: Trail {TRAILING_STOP_PCT*100}% | TP {TAKE_PROFIT_PCT*100}%\n"
+        f"Futuros {FUTURES_LEVERAGE}x (score≥{FUTURES_MIN_SCORE}): Trail {FUTURES_TRAILING*100}% | TP {FUTURES_TP*100}%\n"
+        f"F&G block: <15 | Confianza: >{int(CONFIDENCE_MIN*100)}% | Resumen: 9 AM"
     )
 
-    public_ex = get_public_exchange()
-    trade_ex  = get_trade_exchange()
-    altcoins  = []
-    last_scan = 0  # timestamp del último scan
+    public_ex  = get_public_exchange()
+    trade_ex   = get_trade_exchange()
+    futures_ex = get_futures_exchange()
+    altcoins   = []
+    last_scan  = 0
+    log.info(f"💹 Futuros: {FUTURES_LEVERAGE}x apalancamiento (score ≥{FUTURES_MIN_SCORE})")
 
     while True:
         now = time.time()
@@ -926,7 +996,7 @@ def run_bot():
         # 4. Scan altcoins cada 30 minutos
         if now - last_scan > 600:  # re-scan cada 10 minutos
             log.info("🔍 Escaneando top altcoins por volumen...")
-            altcoins  = scan_top_altcoins(public_ex, max_alts=8)
+            altcoins  = scan_top_altcoins(public_ex, max_alts=15)
             last_scan = now
 
         open_positions = load_positions()
@@ -937,7 +1007,7 @@ def run_bot():
         for symbol in BASE_WATCHLIST:
             try:
                 log.info(f"\n📊 {symbol}...")
-                analyze_and_trade(symbol, "1h", public_ex, trade_ex, fg_value, fg_label, open_positions)
+                analyze_and_trade(symbol, "1h", public_ex, trade_ex, futures_ex, fg_value, fg_label, open_positions)
             except Exception as e:
                 log.error(f"Error {symbol}: {e}")
 
@@ -947,7 +1017,7 @@ def run_bot():
             for symbol in altcoins:
                 try:
                     log.info(f"\n📊 {symbol} [3m]...")
-                    analyze_and_trade(symbol, "3m", public_ex, trade_ex, fg_value, fg_label, open_positions)
+                    analyze_and_trade(symbol, "3m", public_ex, trade_ex, futures_ex, fg_value, fg_label, open_positions)
                 except Exception as e:
                     log.error(f"Error {symbol}: {e}")
 
