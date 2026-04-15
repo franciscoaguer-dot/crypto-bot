@@ -1,9 +1,10 @@
 """
-CryptoBot v3
-- Trailing stop loss dinámico
-- Position sizing por conviction (score de señales)
+CryptoBot v4
+- BTC/ETH/SOL/BNB en 1h (base)
+- Top altcoins por volumen en 15m (dinámicas)
+- Trailing stop + position sizing dinámico
+- Resumen diario a las 9 AM (Argentina)
 - Paper trading mode
-- EMA + MACD + Volume + 4h + Fear&Greed + Noticias
 """
 
 import os
@@ -13,7 +14,7 @@ import json
 import logging
 import requests
 import threading
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import ccxt
 import pandas as pd
 import numpy as np
@@ -33,15 +34,25 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 CAPITAL_TOTAL_USD  = float(os.environ.get("CAPITAL_USD", "100"))
 PAPER_TRADING      = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 
-# Position sizing dinámico por score de señales
-POSITION_SIZE_MAP  = {2: 0.02, 3: 0.03, 4: 0.04, 5: 0.05}  # score → % capital
-TRAILING_STOP_PCT  = 0.015   # trailing stop: 1.5% por debajo del máximo
-TAKE_PROFIT_PCT    = 0.04    # take profit: 4%
+POSITION_SIZE_MAP  = {2: 0.02, 3: 0.03, 4: 0.04, 5: 0.05}
+TRAILING_STOP_PCT  = 0.010   # scalping: 1%
+TAKE_PROFIT_PCT    = 0.025   # scalping: 2.5%
 MIN_SIGNALS        = 2
-LOOP_INTERVAL_SEC  = 300
-WATCHLIST          = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+LOOP_INTERVAL_SEC  = 60     # loop cada 1 minuto
 TRADE_LOG_FILE     = "trade_log.json"
-POSITIONS_FILE     = "positions.json"  # posiciones abiertas para trailing stop
+POSITIONS_FILE     = "positions.json"
+
+# Watchlist base — siempre monitoreada en 1h
+BASE_WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+
+# Stablecoins y tokens a excluir del scanner
+EXCLUDE_SYMBOLS = {
+    "USDT","USDC","BUSD","DAI","TUSD","FDUSD","USDP",
+    "WBTC","WETH","STETH","BETH","BTC","ETH","SOL","BNB"
+}
+
+# Timezone Argentina (UTC-3)
+ARG_TZ = timezone(timedelta(hours=-3))
 
 # ─────────────────────────────────────────
 # DASHBOARD HTML
@@ -51,81 +62,91 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CryptoBot v3</title>
+<title>CryptoBot v4</title>
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
 <style>
-  :root{--bg:#080c10;--surface:#0d1117;--border:#1a2332;--green:#00ff88;--red:#ff3355;--yellow:#ffcc00;--blue:#00aaff;--orange:#ff9900;--muted:#3d5166;--text:#c9d8e8;--mono:'Share Tech Mono',monospace;--sans:'Syne',sans-serif}
+  :root{--bg:#080c10;--surface:#0d1117;--border:#1a2332;--green:#00ff88;--red:#ff3355;--yellow:#ffcc00;--blue:#00aaff;--orange:#ff9900;--purple:#aa55ff;--muted:#3d5166;--text:#c9d8e8;--mono:'Share Tech Mono',monospace;--sans:'Syne',sans-serif}
   *{margin:0;padding:0;box-sizing:border-box}
   body{background:var(--bg);color:var(--text);font-family:var(--mono);min-height:100vh}
   body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(0,255,136,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(0,255,136,.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0}
-  .container{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:40px 24px}
-  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:40px;padding-bottom:24px;border-bottom:1px solid var(--border)}
+  .container{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:36px 20px}
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:36px;padding-bottom:20px;border-bottom:1px solid var(--border)}
   .logo{font-family:var(--sans);font-weight:800;font-size:1.4rem;color:#fff}.logo span{color:var(--green)}
-  .logo small{font-size:.7rem;color:var(--muted);font-weight:400;margin-left:8px}
-  .badges{display:flex;gap:8px}
-  .pill{display:flex;align-items:center;gap:6px;font-size:.72rem;padding:5px 12px;border-radius:100px}
+  .logo small{font-size:.65rem;color:var(--muted);margin-left:8px}
+  .badges{display:flex;gap:8px;flex-wrap:wrap}
+  .pill{display:flex;align-items:center;gap:5px;font-size:.7rem;padding:4px 11px;border-radius:100px}
   .pill-live{color:var(--green);border:1px solid rgba(0,255,136,.3)}
   .pill-paper{color:var(--blue);border:1px solid rgba(0,170,255,.3)}
+  .pill-alt{color:var(--purple);border:1px solid rgba(170,85,255,.3)}
   .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:32px}
-  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px;position:relative;overflow:hidden}
+
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:28px}
+  .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px;position:relative;overflow:hidden}
   .stat-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--accent,var(--green));opacity:.7}
-  .stat-label{font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
-  .stat-value{font-family:var(--sans);font-weight:800;font-size:1.7rem;line-height:1;color:#fff}
-  .stat-value.green{color:var(--green)}.stat-value.red{color:var(--red)}.stat-value.yellow{color:var(--yellow)}.stat-value.blue{color:var(--blue)}.stat-value.orange{color:var(--orange)}
-  .stat-sub{font-size:.62rem;color:var(--muted);margin-top:5px}
+  .stat-label{font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin-bottom:7px}
+  .stat-value{font-family:var(--sans);font-weight:800;font-size:1.6rem;line-height:1;color:#fff}
+  .stat-value.green{color:var(--green)}.stat-value.red{color:var(--red)}.stat-value.yellow{color:var(--yellow)}
+  .stat-value.blue{color:var(--blue)}.stat-value.orange{color:var(--orange)}.stat-value.purple{color:var(--purple)}
+  .stat-sub{font-size:.6rem;color:var(--muted);margin-top:5px}
 
-  /* Posiciones abiertas */
-  .positions-section{margin-bottom:32px}
-  .pos-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
-  .pos-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px}
-  .pos-card.profit{border-color:rgba(0,255,136,.3)}
-  .pos-card.loss{border-color:rgba(255,51,85,.3)}
-  .pos-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-  .pos-symbol{font-family:var(--sans);font-weight:700;font-size:1rem;color:#fff}
-  .pos-pnl{font-family:var(--sans);font-weight:700;font-size:.9rem}
+  /* Scanner */
+  .scanner-section{margin-bottom:28px}
+  .scanner-grid{display:flex;flex-wrap:wrap;gap:8px}
+  .scanner-chip{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 12px;font-size:.7rem;display:flex;align-items:center;gap:6px}
+  .scanner-chip.base{border-color:rgba(0,255,136,.25);color:var(--green)}
+  .scanner-chip.alt{border-color:rgba(170,85,255,.25);color:var(--purple)}
+  .chip-vol{color:var(--muted);font-size:.62rem}
+
+  /* Posiciones */
+  .pos-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-bottom:28px}
+  .pos-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px}
+  .pos-card.profit{border-color:rgba(0,255,136,.3)}.pos-card.loss{border-color:rgba(255,51,85,.3)}
+  .pos-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+  .pos-symbol{font-family:var(--sans);font-weight:700;font-size:.95rem;color:#fff}
+  .pos-tf{font-size:.6rem;color:var(--muted);margin-left:6px}
+  .pos-pnl{font-family:var(--sans);font-weight:700;font-size:.85rem}
   .pos-pnl.pos{color:var(--green)}.pos-pnl.neg{color:var(--red)}
-  .pos-row{display:flex;justify-content:space-between;font-size:.72rem;color:var(--muted);margin-top:4px}
+  .pos-row{display:flex;justify-content:space-between;font-size:.68rem;color:var(--muted);margin-top:3px}
   .pos-row span:last-child{color:var(--text)}
-  .trail-bar-bg{height:3px;background:var(--border);border-radius:2px;margin-top:10px;overflow:hidden}
-  .trail-bar-fill{height:100%;background:var(--orange);border-radius:2px;transition:width .5s}
+  .trail-bar-bg{height:3px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden}
+  .trail-bar-fill{height:100%;background:var(--orange);border-radius:2px}
 
-  .section-title{font-family:var(--sans);font-size:.72rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);margin-bottom:14px}
-  .table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:32px}
-  table{width:100%;border-collapse:collapse;font-size:.76rem}
+  .section-title{font-family:var(--sans);font-size:.7rem;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:var(--muted);margin-bottom:12px}
+  .table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:28px}
+  table{width:100%;border-collapse:collapse;font-size:.74rem}
   thead tr{border-bottom:1px solid var(--border)}
-  th{padding:11px 14px;text-align:left;font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:400}
-  td{padding:11px 14px;border-bottom:1px solid rgba(26,35,50,.5);vertical-align:middle}
+  th{padding:10px 13px;text-align:left;font-size:.58rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);font-weight:400}
+  td{padding:10px 13px;border-bottom:1px solid rgba(26,35,50,.5);vertical-align:middle}
   tr:last-child td{border-bottom:none}tr:hover td{background:rgba(255,255,255,.02)}
-  .badge{display:inline-block;padding:2px 9px;border-radius:4px;font-size:.68rem;font-weight:700}
+  .badge{display:inline-block;padding:2px 8px;border-radius:3px;font-size:.65rem;font-weight:700}
   .badge-buy{background:rgba(0,255,136,.12);color:var(--green);border:1px solid rgba(0,255,136,.2)}
   .badge-sell{background:rgba(255,51,85,.12);color:var(--red);border:1px solid rgba(255,51,85,.2)}
-  .badge-hold{background:rgba(61,81,102,.3);color:var(--muted);border:1px solid rgba(61,81,102,.4)}
-  .badge-paper{font-size:.54rem;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.2);padding:1px 5px;border-radius:3px;margin-left:4px;vertical-align:middle}
-  .badge-trail{font-size:.54rem;background:rgba(255,153,0,.1);color:var(--orange);border:1px solid rgba(255,153,0,.2);padding:1px 5px;border-radius:3px;margin-left:4px;vertical-align:middle}
-  .conf-bar{display:flex;align-items:center;gap:8px}
-  .bar-bg{flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden}
+  .badge-paper{font-size:.52rem;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.2);padding:1px 4px;border-radius:3px;margin-left:3px}
+  .badge-trail{font-size:.52rem;background:rgba(255,153,0,.1);color:var(--orange);border:1px solid rgba(255,153,0,.2);padding:1px 4px;border-radius:3px;margin-left:3px}
+  .badge-alt{font-size:.52rem;background:rgba(170,85,255,.1);color:var(--purple);border:1px solid rgba(170,85,255,.2);padding:1px 4px;border-radius:3px;margin-left:3px}
+  .conf-bar{display:flex;align-items:center;gap:6px}
+  .bar-bg{flex:1;height:3px;background:var(--border);border-radius:2px;overflow:hidden}
   .bar-fill{height:100%;background:var(--green);border-radius:2px}
-  .pair{color:#fff;font-weight:600}.ts{color:var(--muted);font-size:.68rem}
-  .empty{text-align:center;padding:50px 20px;color:var(--muted)}
-  .empty-icon{font-size:2rem;margin-bottom:10px}.empty-text{font-size:.82rem;line-height:1.6}
-  footer{text-align:center;font-size:.68rem;color:var(--muted);padding-top:20px;border-top:1px solid var(--border)}
-  .refresh-info{font-size:.68rem;color:var(--muted);text-align:right;margin-bottom:10px}
+  .pair{color:#fff;font-weight:600}.ts{color:var(--muted);font-size:.65rem}
+  .empty{text-align:center;padding:48px 20px;color:var(--muted)}
+  .empty-icon{font-size:2rem;margin-bottom:10px}.empty-text{font-size:.8rem;line-height:1.6}
+  footer{text-align:center;font-size:.65rem;color:var(--muted);padding-top:18px;border-top:1px solid var(--border)}
+  .refresh-info{font-size:.65rem;color:var(--muted);text-align:right;margin-bottom:10px}
   #countdown{color:var(--green)}
-  .fg-pill{display:inline-block;padding:2px 7px;border-radius:3px;font-size:.62rem;font-weight:700}
+  .fg-pill{display:inline-block;padding:2px 6px;border-radius:3px;font-size:.6rem;font-weight:700}
   .fg-fear{background:rgba(255,51,85,.15);color:var(--red)}
   .fg-greed{background:rgba(0,255,136,.15);color:var(--green)}
   .fg-neutral{background:rgba(255,204,0,.15);color:var(--yellow)}
-  .size-badge{font-size:.62rem;color:var(--orange);font-weight:700}
 </style>
 </head>
 <body>
 <div class="container">
   <header>
-    <div class="logo">Crypto<span>Bot</span><small>v3</small></div>
+    <div class="logo">Crypto<span>Bot</span><small>v4</small></div>
     <div class="badges">
       <div class="pill pill-paper" id="mode-pill"><div class="dot"></div><span id="mode-text">PAPER</span></div>
+      <div class="pill pill-alt"><div class="dot"></div>ALTCOIN SCANNER</div>
       <div class="pill pill-live"><div class="dot"></div>LIVE</div>
     </div>
   </header>
@@ -133,14 +154,20 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="stats">
     <div class="stat-card" style="--accent:var(--blue)"><div class="stat-label">Total Trades</div><div class="stat-value" id="total">—</div><div class="stat-sub">paper + real</div></div>
     <div class="stat-card" style="--accent:var(--green)"><div class="stat-label">Compras</div><div class="stat-value green" id="buys">—</div><div class="stat-sub">BUY</div></div>
-    <div class="stat-card" style="--accent:var(--red)"><div class="stat-label">Ventas</div><div class="stat-value red" id="sells">—</div><div class="stat-sub">SELL</div></div>
-    <div class="stat-card" style="--accent:var(--yellow)"><div class="stat-label">Confianza</div><div class="stat-value yellow" id="avg-conf">—</div><div class="stat-sub">promedio Claude</div></div>
-    <div class="stat-card" style="--accent:var(--blue)"><div class="stat-label">Fear & Greed</div><div class="stat-value blue" id="fg-val">—</div><div class="stat-sub" id="fg-lbl">cargando...</div></div>
+    <div class="stat-card" style="--accent:var(--red)"><div class="stat-label">Win Rate</div><div class="stat-value red" id="winrate">—</div><div class="stat-sub">trades cerrados</div></div>
+    <div class="stat-card" style="--accent:var(--yellow)"><div class="stat-label">P&L Total</div><div class="stat-value yellow" id="pnl">—</div><div class="stat-sub">paper USD</div></div>
+    <div class="stat-card" style="--accent:var(--blue)"><div class="stat-label">Fear & Greed</div><div class="stat-value blue" id="fg-val">—</div><div class="stat-sub" id="fg-lbl">—</div></div>
     <div class="stat-card" style="--accent:var(--orange)"><div class="stat-label">Posiciones</div><div class="stat-value orange" id="open-pos">—</div><div class="stat-sub">abiertas</div></div>
+    <div class="stat-card" style="--accent:var(--purple)"><div class="stat-label">Altcoins</div><div class="stat-value purple" id="altcount">—</div><div class="stat-sub">en scanner</div></div>
   </div>
 
-  <div class="positions-section" id="positions-section" style="display:none">
-    <div class="section-title">Posiciones abiertas (trailing stop activo)</div>
+  <div class="scanner-section">
+    <div class="section-title">Scanner activo</div>
+    <div class="scanner-grid" id="scanner-grid"><span style="color:var(--muted);font-size:.75rem">Cargando...</span></div>
+  </div>
+
+  <div id="positions-section" style="display:none;margin-bottom:28px">
+    <div class="section-title">Posiciones abiertas</div>
     <div class="pos-grid" id="pos-grid"></div>
   </div>
 
@@ -148,11 +175,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="section-title">Historial de operaciones</div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Par</th><th>Acción</th><th>Precio</th><th>Size</th><th>Confianza</th><th>Señales</th><th>F&G</th><th>Razonamiento</th><th>Timestamp</th></tr></thead>
+      <thead><tr><th>Par</th><th>TF</th><th>Acción</th><th>Precio</th><th>Size</th><th>Confianza</th><th>Señales</th><th>F&G</th><th>Razonamiento</th><th>Timestamp</th></tr></thead>
       <tbody id="trades-body"></tbody>
     </table>
   </div>
-  <footer>CryptoBot v3 · Trailing Stop · Position Sizing Dinámico · Paper Trading</footer>
+  <footer>CryptoBot v4 · Altcoin Scanner · Trailing Stop · Position Sizing · Resumen Diario</footer>
 </div>
 <script>
 let countdown=30;
@@ -161,12 +188,18 @@ async function loadData(){
     const res=await fetch('/api/trades');
     const data=await res.json();
     const trades=(data.trades||[]).filter(t=>t.action!=='HOLD');
+    const closed=trades.filter(t=>t.pnl_pct!==undefined);
+    const winners=closed.filter(t=>t.pnl_pct>0);
 
     document.getElementById('total').textContent=trades.length;
     document.getElementById('buys').textContent=trades.filter(t=>t.action==='BUY').length;
-    document.getElementById('sells').textContent=trades.filter(t=>t.action==='SELL').length;
-    const avgConf=trades.length?(trades.reduce((s,t)=>s+(t.confidence||0),0)/trades.length*100).toFixed(0)+'%':'—';
-    document.getElementById('avg-conf').textContent=avgConf;
+    document.getElementById('winrate').textContent=closed.length?(Math.round(winners.length/closed.length*100)+'%'):'—';
+    document.getElementById('winrate').className='stat-value '+(closed.length&&winners.length/closed.length>=0.5?'green':'red');
+
+    const totalPnl=closed.reduce((s,t)=>s+(t.pnl_pct||0)*(t.usd_size||3)/100,0);
+    const pnlEl=document.getElementById('pnl');
+    pnlEl.textContent=(totalPnl>=0?'+':'')+'$'+totalPnl.toFixed(2);
+    pnlEl.className='stat-value '+(totalPnl>=0?'green':'red');
 
     if(data.fear_greed){
       const fg=data.fear_greed;
@@ -176,14 +209,21 @@ async function loadData(){
       el.className='stat-value '+(fg.value<35?'red':fg.value>65?'green':'yellow');
     }
 
-    // Paper mode indicator
-    const hasPaper=trades.some(t=>t.paper);
-    const hasReal=trades.some(t=>!t.paper);
-    const pill=document.getElementById('mode-pill');
-    document.getElementById('mode-text').textContent=hasReal?'REAL':'PAPER';
-    pill.className='pill '+(hasReal?'pill-live':'pill-paper');
+    // Scanner
+    const scanner=data.scanner||[];
+    document.getElementById('altcount').textContent=scanner.filter(s=>!['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT'].includes(s.symbol)).length;
+    document.getElementById('scanner-grid').innerHTML=scanner.map(s=>{
+      const isBase=['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT'].includes(s.symbol);
+      const vol=s.volume?'$'+Math.round(s.volume/1e6)+'M':'';
+      return `<div class="scanner-chip ${isBase?'base':'alt'}">${s.symbol.replace('/USDT','')}<span class="chip-vol">${vol}</span></div>`;
+    }).join('')||'<span style="color:var(--muted);font-size:.75rem">Sin datos</span>';
 
-    // Posiciones abiertas
+    // Mode pill
+    const hasReal=trades.some(t=>!t.paper);
+    document.getElementById('mode-text').textContent=hasReal?'REAL':'PAPER';
+    document.getElementById('mode-pill').className='pill '+(hasReal?'pill-live':'pill-paper');
+
+    // Posiciones
     const positions=data.positions||[];
     document.getElementById('open-pos').textContent=positions.length;
     const posSection=document.getElementById('positions-section');
@@ -191,19 +231,16 @@ async function loadData(){
       posSection.style.display='block';
       document.getElementById('pos-grid').innerHTML=positions.map(p=>{
         const pnlPct=((p.current_price-p.entry_price)/p.entry_price*100).toFixed(2);
-        const trailPct=((p.current_price-p.trail_stop)/p.current_price*100).toFixed(1);
         const isProfit=pnlPct>=0;
-        const distToTrail=((p.current_price-p.trail_stop)/p.current_price*100);
+        const distToTrail=(p.current_price-p.trail_stop)/p.current_price*100;
         const barWidth=Math.min(100,Math.max(0,(1-distToTrail/5)*100));
+        const tfBadge=p.timeframe==='15m'?'<span style="color:var(--purple);font-size:.6rem">15m</span>':'<span style="color:var(--green);font-size:.6rem">1h</span>';
         return `<div class="pos-card ${isProfit?'profit':'loss'}">
-          <div class="pos-header">
-            <span class="pos-symbol">${p.symbol}</span>
-            <span class="pos-pnl ${isProfit?'pos':'neg'}">${isProfit?'+':''}${pnlPct}%</span>
-          </div>
+          <div class="pos-header"><span class="pos-symbol">${p.symbol}${tfBadge}</span><span class="pos-pnl ${isProfit?'pos':'neg'}">${isProfit?'+':''}${pnlPct}%</span></div>
           <div class="pos-row"><span>Entrada</span><span>${p.entry_price}</span></div>
-          <div class="pos-row"><span>Precio actual</span><span>${p.current_price}</span></div>
-          <div class="pos-row"><span>🔴 Trail Stop</span><span style="color:var(--orange)">${p.trail_stop}</span></div>
-          <div class="pos-row"><span>🎯 Take Profit</span><span style="color:var(--green)">${p.take_profit}</span></div>
+          <div class="pos-row"><span>Actual</span><span>${p.current_price}</span></div>
+          <div class="pos-row"><span>🔴 Trail</span><span style="color:var(--orange)">${p.trail_stop}</span></div>
+          <div class="pos-row"><span>🎯 TP</span><span style="color:var(--green)">${p.take_profit}</span></div>
           <div class="pos-row"><span>Size</span><span>$${p.usd_size}</span></div>
           <div class="trail-bar-bg"><div class="trail-bar-fill" style="width:${barWidth}%"></div></div>
         </div>`;
@@ -213,33 +250,35 @@ async function loadData(){
     // Trades table
     const tbody=document.getElementById('trades-body');
     if(!trades.length){
-      tbody.innerHTML='<tr><td colspan="9"><div class="empty"><div class="empty-icon">🤖</div><div class="empty-text">El bot está analizando señales...<br>Las operaciones aparecerán aquí cuando se ejecuten.</div></div></td></tr>';
+      tbody.innerHTML='<tr><td colspan="10"><div class="empty"><div class="empty-icon">🤖</div><div class="empty-text">El bot está analizando señales...<br>Las operaciones aparecerán aquí cuando se ejecuten.</div></div></td></tr>';
       return;
     }
     tbody.innerHTML=[...trades].reverse().map(t=>{
       const ts=new Date(t.timestamp).toLocaleString('es-AR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
       const conf=Math.round((t.confidence||0)*100);
-      const signals=[];
-      if(t.tech_signal===1)signals.push('📈EMA');else if(t.tech_signal===-1)signals.push('📉EMA');
-      if(t.macd_signal===1)signals.push('📊+');else if(t.macd_signal===-1)signals.push('📊-');
-      if(t.vol_signal===1)signals.push('📦VOL');
-      if(t.tf4h_signal===1)signals.push('⏱4H+');else if(t.tf4h_signal===-1)signals.push('⏱4H-');
-      if(t.news_signal===1)signals.push('📰+');else if(t.news_signal===-1)signals.push('📰-');
+      const sigs=[];
+      if(t.tech_signal===1)sigs.push('📈');else if(t.tech_signal===-1)sigs.push('📉');
+      if(t.macd_signal===1)sigs.push('📊+');else if(t.macd_signal===-1)sigs.push('📊-');
+      if(t.vol_signal===1)sigs.push('📦');
+      if(t.tf4h_signal===1)sigs.push('⏱+');else if(t.tf4h_signal===-1)sigs.push('⏱-');
+      if(t.news_signal===1)sigs.push('📰+');else if(t.news_signal===-1)sigs.push('📰-');
       const fgVal=t.fear_greed_value||'—';
       const fgCls=fgVal<35?'fg-fear':fgVal>65?'fg-greed':'fg-neutral';
       const paperTag=t.paper?'<span class="badge-paper">PAPER</span>':'';
       const trailTag=t.trail_triggered?'<span class="badge-trail">TRAIL</span>':'';
-      const price=t.price?t.price.toLocaleString('en-US',{maximumFractionDigits:4}):'—';
-      const sizeUSD=t.usd_size?`$${t.usd_size}`:(t.risk_pct?`${(t.risk_pct*100).toFixed(0)}%`:'—');
+      const altTag=t.timeframe==='15m'?'<span class="badge-alt">ALT</span>':'';
+      const price=t.price?(+t.price).toLocaleString('en-US',{maximumFractionDigits:4}):'—';
+      const pnlStr=t.pnl_pct!==undefined?`<span style="color:${t.pnl_pct>=0?'var(--green)':'var(--red)'}"> ${t.pnl_pct>=0?'+':''}${t.pnl_pct}%</span>`:'';
       return `<tr>
-        <td class="pair">${t.symbol||'—'}</td>
-        <td><span class="badge badge-${(t.action||'').toLowerCase()}">${t.action||'—'}</span>${paperTag}${trailTag}</td>
-        <td style="color:var(--text)">${price}</td>
-        <td class="size-badge">${sizeUSD}</td>
-        <td><div class="conf-bar"><div class="bar-bg"><div class="bar-fill" style="width:${conf}%"></div></div><span style="font-size:.7rem;min-width:30px">${conf}%</span></div></td>
-        <td style="color:var(--muted);font-size:.68rem">${signals.join(' ')}</td>
+        <td class="pair">${t.symbol||'—'}${pnlStr}</td>
+        <td style="color:${t.timeframe==='15m'?'var(--purple)':'var(--muted)'}">${t.timeframe||'1h'}</td>
+        <td><span class="badge badge-${(t.action||'').toLowerCase()}">${t.action||'—'}</span>${paperTag}${trailTag}${altTag}</td>
+        <td>${price}</td>
+        <td style="color:var(--orange);font-size:.68rem">${t.usd_size?'$'+t.usd_size:'—'}</td>
+        <td><div class="conf-bar"><div class="bar-bg"><div class="bar-fill" style="width:${conf}%"></div></div><span style="font-size:.68rem;min-width:28px">${conf}%</span></div></td>
+        <td style="font-size:.65rem">${sigs.join(' ')}</td>
         <td><span class="fg-pill ${fgCls}">${fgVal}</span></td>
-        <td style="color:var(--muted);max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.reasoning||''}">${t.reasoning||'—'}</td>
+        <td style="color:var(--muted);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${t.reasoning||''}">${t.reasoning||'—'}</td>
         <td class="ts">${ts}</td>
       </tr>`;
     }).join('');
@@ -254,8 +293,9 @@ loadData();setInterval(tick,1000);
 # ─────────────────────────────────────────
 # FLASK
 # ─────────────────────────────────────────
-flask_app   = Flask(__name__)
-_fear_greed = {"value": 50, "label": "Neutral"}
+flask_app    = Flask(__name__)
+_fear_greed  = {"value": 50, "label": "Neutral"}
+_scanner     = []
 
 @flask_app.route("/")
 def index(): return render_template_string(DASHBOARD_HTML)
@@ -268,8 +308,12 @@ def api_trades():
             with open(TRADE_LOG_FILE) as f: trades = json.load(f)
         except: pass
     positions = load_positions()
-    # Enriquecer posiciones con precio actual (en memoria)
-    return jsonify({"trades": trades, "count": len(trades), "fear_greed": _fear_greed, "positions": list(positions.values())})
+    return jsonify({
+        "trades": trades, "count": len(trades),
+        "fear_greed": _fear_greed,
+        "positions": list(positions.values()),
+        "scanner": _scanner
+    })
 
 @flask_app.route("/health")
 def health(): return jsonify({"status": "ok", "paper": PAPER_TRADING})
@@ -291,6 +335,63 @@ def send_telegram(msg):
     except Exception as e: log.warning(f"Telegram error: {e}")
 
 # ─────────────────────────────────────────
+# RESUMEN DIARIO
+# ─────────────────────────────────────────
+_last_daily_report = None
+
+def maybe_send_daily_report(fg_value, fg_label):
+    """Envía resumen diario a las 9 AM Argentina si no se mandó hoy."""
+    global _last_daily_report
+    now_arg = datetime.now(ARG_TZ)
+    today   = now_arg.date()
+
+    if _last_daily_report == today: return
+    if now_arg.hour != 9: return
+
+    _last_daily_report = today
+
+    trades = []
+    if os.path.exists(TRADE_LOG_FILE):
+        try:
+            with open(TRADE_LOG_FILE) as f: trades = json.load(f)
+        except: pass
+
+    # Filtrar trades de las últimas 24h
+    cutoff = now_arg - timedelta(hours=24)
+    today_trades = []
+    for t in trades:
+        try:
+            ts = datetime.fromisoformat(t["timestamp"]).replace(tzinfo=timezone.utc).astimezone(ARG_TZ)
+            if ts >= cutoff: today_trades.append(t)
+        except: pass
+
+    buys   = [t for t in today_trades if t.get("action") == "BUY"]
+    sells  = [t for t in today_trades if t.get("action") == "SELL"]
+    closed = [t for t in today_trades if t.get("pnl_pct") is not None]
+    winners = [t for t in closed if t.get("pnl_pct", 0) > 0]
+    total_pnl = sum((t.get("pnl_pct", 0) * t.get("usd_size", 3)) / 100 for t in closed)
+    win_rate  = round(len(winners) / len(closed) * 100) if closed else 0
+
+    best  = max(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
+    worst = min(closed, key=lambda t: t.get("pnl_pct", 0), default=None)
+
+    msg = (
+        f"📊 <b>Resumen diario — {today.strftime('%d/%m/%Y')}</b>\n\n"
+        f"📈 Compras: {len(buys)} | 📉 Ventas: {len(sells)}\n"
+        f"✅ Cerrados: {len(closed)} | Win rate: {win_rate}%\n"
+        f"💰 P&L del día: {'+'if total_pnl>=0 else ''}${total_pnl:.2f}\n\n"
+    )
+    if best:
+        msg += f"🏆 Mejor: {best['symbol']} {'+' if best['pnl_pct']>=0 else ''}{best['pnl_pct']}%\n"
+    if worst and worst != best:
+        msg += f"💀 Peor: {worst['symbol']} {worst['pnl_pct']}%\n"
+    msg += f"\n🧭 F&G ahora: {fg_value} — {fg_label}\n"
+    msg += f"{'📝 PAPER MODE' if PAPER_TRADING else '💰 REAL MODE'}"
+
+    send_telegram(msg)
+    log.info(f"📊 Resumen diario enviado")
+
+# ─────────────────────────────────────────
 # EXCHANGES
 # ─────────────────────────────────────────
 def get_public_exchange():
@@ -307,18 +408,49 @@ def get_trade_exchange():
     })
 
 # ─────────────────────────────────────────
-# POSITION SIZING DINÁMICO
+# ALTCOIN SCANNER — top por volumen 24h
+# ─────────────────────────────────────────
+def scan_top_altcoins(exchange, max_alts=8):
+    """Devuelve top altcoins por volumen en USDT, excluyendo stables y base watchlist."""
+    global _scanner
+    try:
+        tickers = exchange.fetch_tickers()
+        usdt_pairs = []
+        for symbol, t in tickers.items():
+            if not symbol.endswith("/USDT"): continue
+            base = symbol.replace("/USDT", "")
+            if base in EXCLUDE_SYMBOLS: continue
+            vol = t.get("quoteVolume") or 0
+            if vol < 5_000_000: continue  # mínimo $5M de volumen
+            usdt_pairs.append({"symbol": symbol, "volume": vol})
+
+        usdt_pairs.sort(key=lambda x: x["volume"], reverse=True)
+        altcoins = [p["symbol"] for p in usdt_pairs[:max_alts]]
+
+        # Scanner list para el dashboard (base + alts)
+        _scanner = (
+            [{"symbol": s, "volume": None} for s in BASE_WATCHLIST] +
+            usdt_pairs[:max_alts]
+        )
+
+        log.info(f"🔍 Altcoins seleccionadas: {altcoins}")
+        return altcoins
+    except Exception as e:
+        log.error(f"Scanner error: {e}")
+        return []
+
+# ─────────────────────────────────────────
+# POSITION SIZING
 # ─────────────────────────────────────────
 def get_position_size(capital, signal_score):
-    """Más señales alineadas = más capital en juego."""
     abs_score = abs(signal_score)
     pct = POSITION_SIZE_MAP.get(abs_score, 0.02)
     usd = round(capital * pct, 2)
-    log.info(f"  💰 Position size: {pct*100:.0f}% = ${usd} (score={signal_score:+d})")
+    log.info(f"  💰 Size: {pct*100:.0f}% = ${usd} (score={signal_score:+d})")
     return usd, pct
 
 # ─────────────────────────────────────────
-# TRAILING STOP — GESTIÓN DE POSICIONES
+# TRAILING STOP
 # ─────────────────────────────────────────
 def load_positions():
     if os.path.exists(POSITIONS_FILE):
@@ -330,90 +462,68 @@ def load_positions():
 def save_positions(positions):
     with open(POSITIONS_FILE, "w") as f: json.dump(positions, f, indent=2, default=str)
 
-def open_position(symbol, entry_price, usd_size, pct, action):
+def open_position(symbol, entry_price, usd_size, pct, action, timeframe):
     positions = load_positions()
     positions[symbol] = {
-        "symbol":       symbol,
-        "action":       action,
-        "entry_price":  entry_price,
-        "current_price": entry_price,
-        "high_price":   entry_price,
-        "trail_stop":   round(entry_price * (1 - TRAILING_STOP_PCT), 4),
-        "take_profit":  round(entry_price * (1 + TAKE_PROFIT_PCT), 4),
-        "usd_size":     usd_size,
-        "risk_pct":     pct,
-        "opened_at":    datetime.now().isoformat(),
+        "symbol": symbol, "action": action, "timeframe": timeframe,
+        "entry_price": entry_price, "current_price": entry_price, "high_price": entry_price,
+        "trail_stop":  round(entry_price * (1 - TRAILING_STOP_PCT), 4),
+        "take_profit": round(entry_price * (1 + TAKE_PROFIT_PCT), 4),
+        "usd_size": usd_size, "risk_pct": pct,
+        "opened_at": datetime.now().isoformat(),
     }
     save_positions(positions)
-    log.info(f"  📂 Posición abierta: {symbol} @ {entry_price} | Trail={positions[symbol]['trail_stop']} TP={positions[symbol]['take_profit']}")
+    log.info(f"  📂 Posición abierta: {symbol} [{timeframe}] @ {entry_price} | Trail={positions[symbol]['trail_stop']} TP={positions[symbol]['take_profit']}")
 
 def update_trailing_stops(public_ex):
-    """Actualiza trailing stops con precios actuales y cierra posiciones si corresponde."""
     positions = load_positions()
     if not positions: return
-
     closed = []
     for symbol, pos in positions.items():
         try:
             current = public_ex.fetch_ticker(symbol)["last"]
             pos["current_price"] = current
-
             if pos["action"] == "BUY":
-                # Actualizar trailing stop si el precio subió
                 if current > pos["high_price"]:
-                    pos["high_price"]  = current
-                    pos["trail_stop"]  = round(current * (1 - TRAILING_STOP_PCT), 4)
-                    log.info(f"  📈 Trail stop actualizado {symbol}: {pos['trail_stop']} (precio: {current})")
+                    pos["high_price"] = current
+                    pos["trail_stop"] = round(current * (1 - TRAILING_STOP_PCT), 4)
+                    log.info(f"  📈 Trail actualizado {symbol}: {pos['trail_stop']}")
 
-                # Verificar si se activó el trailing stop
                 if current <= pos["trail_stop"]:
-                    pnl_pct = (current - pos["entry_price"]) / pos["entry_price"] * 100
-                    log.info(f"  🔴 TRAIL STOP activado {symbol} @ {current} | PnL: {pnl_pct:.2f}%")
+                    pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    log.info(f"  🔴 TRAIL STOP {symbol} @ {current} | PnL: {pnl:.2f}%")
                     send_telegram(
-                        f"🔴 <b>Trail Stop activado</b>\n"
-                        f"Par: <b>{symbol}</b>\n"
-                        f"Entrada: {pos['entry_price']} | Salida: {current}\n"
-                        f"PnL: {pnl_pct:+.2f}%\n"
-                        f"{'✅ Ganancia' if pnl_pct > 0 else '❌ Pérdida'}"
+                        f"🔴 <b>Trail Stop</b> — {symbol}\n"
+                        f"Entrada: {pos['entry_price']} → Salida: {current}\n"
+                        f"PnL: {pnl:+.2f}% {'✅' if pnl>0 else '❌'}"
                     )
-                    save_trade({
-                        "timestamp": datetime.now().isoformat(),
-                        "symbol": symbol, "action": "SELL",
-                        "price": current, "reasoning": f"Trail stop activado (entrada: {pos['entry_price']})",
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action": "SELL", "price": current, "timeframe": pos.get("timeframe","1h"),
+                        "reasoning": f"Trail stop (entrada {pos['entry_price']})",
                         "confidence": 1.0, "paper": PAPER_TRADING,
-                        "pnl_pct": round(pnl_pct, 2), "trail_triggered": True,
-                        "entry_price": pos["entry_price"], "usd_size": pos["usd_size"],
-                    })
-                    closed.append(symbol)
-                    continue
+                        "pnl_pct": round(pnl,2), "trail_triggered": True,
+                        "entry_price": pos["entry_price"], "usd_size": pos["usd_size"]})
+                    closed.append(symbol); continue
 
-                # Verificar take profit
                 if current >= pos["take_profit"]:
-                    pnl_pct = (current - pos["entry_price"]) / pos["entry_price"] * 100
-                    log.info(f"  🎯 TAKE PROFIT {symbol} @ {current} | PnL: +{pnl_pct:.2f}%")
+                    pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    log.info(f"  🎯 TAKE PROFIT {symbol} @ {current} | PnL: +{pnl:.2f}%")
                     send_telegram(
-                        f"🎯 <b>Take Profit alcanzado</b>\n"
-                        f"Par: <b>{symbol}</b>\n"
-                        f"Entrada: {pos['entry_price']} | Salida: {current}\n"
-                        f"PnL: +{pnl_pct:.2f}% 🎉"
+                        f"🎯 <b>Take Profit</b> — {symbol}\n"
+                        f"Entrada: {pos['entry_price']} → Salida: {current}\n"
+                        f"PnL: +{pnl:.2f}% 🎉"
                     )
-                    save_trade({
-                        "timestamp": datetime.now().isoformat(),
-                        "symbol": symbol, "action": "SELL",
-                        "price": current, "reasoning": f"Take profit alcanzado (entrada: {pos['entry_price']})",
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action": "SELL", "price": current, "timeframe": pos.get("timeframe","1h"),
+                        "reasoning": f"Take profit (entrada {pos['entry_price']})",
                         "confidence": 1.0, "paper": PAPER_TRADING,
-                        "pnl_pct": round(pnl_pct, 2), "trail_triggered": False,
-                        "entry_price": pos["entry_price"], "usd_size": pos["usd_size"],
-                    })
+                        "pnl_pct": round(pnl,2), "trail_triggered": False,
+                        "entry_price": pos["entry_price"], "usd_size": pos["usd_size"]})
                     closed.append(symbol)
-
         except Exception as e:
-            log.error(f"Error actualizando trailing {symbol}: {e}")
+            log.error(f"Error trailing {symbol}: {e}")
 
-    # Cerrar posiciones alcanzadas
-    for symbol in closed:
-        del positions[symbol]
-
+    for s in closed: del positions[s]
     save_positions(positions)
 
 # ─────────────────────────────────────────
@@ -430,8 +540,7 @@ def calculate_indicators(df):
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
     delta = df["close"].diff()
-    gain  = delta.clip(lower=0)
-    loss  = -delta.clip(upper=0)
+    gain  = delta.clip(lower=0); loss = -delta.clip(upper=0)
     df["rsi"] = 100 - (100 / (1 + gain.ewm(com=13, adjust=False).mean() / loss.ewm(com=13, adjust=False).mean().replace(0, np.nan)))
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
@@ -462,12 +571,14 @@ def volume_signal(df):
     if pd.isna(last["vol_ma20"]): return 0
     return +1 if last["volume"] > last["vol_ma20"] * 1.2 else 0
 
-def timeframe_4h_signal(exchange, symbol):
+def timeframe_confirm_signal(exchange, symbol, base_tf):
+    """Para 3m usa 15m como confirmación. Para 1h usa 30m."""
+    confirm_tf = "15m" if base_tf == "3m" else ("30m" if base_tf == "1h" else "4h")
     try:
-        df4h = calculate_indicators(get_ohlcv(exchange, symbol, timeframe="4h", limit=50))
-        return technical_signal(df4h)
+        df = calculate_indicators(get_ohlcv(exchange, symbol, timeframe=confirm_tf, limit=50))
+        return technical_signal(df)
     except Exception as e:
-        log.warning(f"4h signal error {symbol}: {e}")
+        log.warning(f"Confirm signal error {symbol}: {e}")
         return 0
 
 # ─────────────────────────────────────────
@@ -481,19 +592,14 @@ def get_fear_greed():
         value = int(data["value"])
         label = data["value_classification"]
         _fear_greed = {"value": value, "label": label}
-        log.info(f"  Fear & Greed: {value} ({label})")
         return value, label
     except Exception as e:
         log.warning(f"Fear & Greed error: {e}")
         return 50, "Neutral"
 
 def fear_greed_filter(value, action):
-    if action == "BUY"  and value < 25:
-        log.info(f"  🚫 Bloqueado por Extreme Fear ({value})")
-        return False
-    if action == "SELL" and value > 75:
-        log.info(f"  🚫 Bloqueado por Extreme Greed ({value})")
-        return False
+    if action == "BUY"  and value < 25: return False
+    if action == "SELL" and value > 75: return False
     return True
 
 # ─────────────────────────────────────────
@@ -506,7 +612,7 @@ COIN_NAMES = {"btc":["bitcoin","btc"],"eth":["ethereum","eth"],"sol":["solana","
 
 def get_news_sentiment(symbol):
     coin  = symbol.split("/")[0].lower()
-    terms = COIN_NAMES.get(coin, [coin])
+    terms = COIN_NAMES.get(coin, [coin.lower()])
     all_titles = []
     for url in RSS_FEEDS:
         try:
@@ -514,14 +620,13 @@ def get_news_sentiment(symbol):
             titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>", resp.text)
             if not titles: titles = re.findall(r"<title>(.*?)</title>", resp.text)
             all_titles.extend(titles[:15])
-        except Exception as e: log.warning(f"RSS error: {e}")
+        except: pass
     if not all_titles: return 0
-    relevant  = [t.lower() for t in all_titles if any(term in t.lower() for term in terms)]
+    relevant = [t.lower() for t in all_titles if any(term in t.lower() for term in terms)]
     if not relevant: relevant = [t.lower() for t in all_titles]
     text = " ".join(relevant)
     bull = sum(1 for kw in BULLISH_KW if kw in text)
     bear = sum(1 for kw in BEARISH_KW if kw in text)
-    log.info(f"  Noticias: {len(relevant)} | bull={bull} bear={bear}")
     if bull > bear: return +1
     if bear > bull: return -1
     return 0
@@ -529,21 +634,20 @@ def get_news_sentiment(symbol):
 # ─────────────────────────────────────────
 # CLAUDE
 # ─────────────────────────────────────────
-def ask_claude(symbol, signals, df, fg_value, usd_size, pct):
+def ask_claude(symbol, signals, df, fg_value, usd_size, pct, timeframe):
     last  = df.iloc[-1]
     total = sum(signals.values())
     direction = "BULLISH" if total > 0 else "BEARISH"
-    prompt = f"""Sos un analista de trading crypto experto. Respondé SOLO en JSON sin backticks.
+    prompt = f"""Trading crypto analyst. Respond ONLY in JSON, no backticks.
 
-Par: {symbol} | Precio: {last['close']:.4f} USDT
+Pair: {symbol} [{timeframe}] | Price: {last['close']:.4f} USDT
 EMA9: {last['ema9']:.4f} | EMA21: {last['ema21']:.4f} | RSI: {last['rsi']:.1f}
-MACD hist: {last['macd_hist']:.4f} | Volumen vs MA20: {last['volume']:.0f}/{last['vol_ma20']:.0f}
-Fear & Greed: {fg_value}
+MACD hist: {last['macd_hist']:.4f} | Vol/MA20: {last['volume']:.0f}/{last['vol_ma20']:.0f}
+Fear&Greed: {fg_value} | Timeframe: {timeframe}
+Signals (EMA:{signals['tech']:+d} MACD:{signals['macd']:+d} VOL:{signals['vol']:+d} CONF:{signals['tf4h']:+d} NEWS:{signals['news']:+d}) = {total:+d}
+Position: ${usd_size} ({pct*100:.0f}%) | Trail: {TRAILING_STOP_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%
 
-Señales (EMA:{signals['tech']:+d} MACD:{signals['macd']:+d} VOL:{signals['vol']:+d} 4H:{signals['tf4h']:+d} NEWS:{signals['news']:+d}) = {total:+d}
-Position size: ${usd_size} ({pct*100:.0f}% capital) — Trailing stop: {TRAILING_STOP_PCT*100:.1f}%
-
-{{"action":"BUY"|"SELL"|"HOLD","confidence":0.0,"reasoning":"una línea"}}"""
+{{"action":"BUY"|"SELL"|"HOLD","confidence":0.0,"reasoning":"one line"}}"""
     try:
         resp = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
@@ -562,10 +666,7 @@ def execute_trade(trade_exchange, symbol, action, usd_size):
     try:
         price = trade_exchange.fetch_ticker(symbol)["last"]
         qty   = usd_size / price
-        if action == "BUY":
-            order = trade_exchange.create_market_buy_order(symbol, qty)
-        elif action == "SELL":
-            order = trade_exchange.create_market_sell_order(symbol, qty)
+        order = trade_exchange.create_market_buy_order(symbol, qty) if action == "BUY" else trade_exchange.create_market_sell_order(symbol, qty)
         return order, price
     except Exception as e:
         log.error(f"Error orden {action} {symbol}: {e}")
@@ -580,142 +681,142 @@ def save_trade(record):
     with open(TRADE_LOG_FILE,"w") as f: json.dump(data, f, indent=2, default=str)
 
 # ─────────────────────────────────────────
+# ANALIZAR UN PAR
+# ─────────────────────────────────────────
+def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, fg_value, fg_label, open_positions):
+    """Analiza un par y ejecuta/registra trade si hay señal."""
+    if symbol in open_positions:
+        log.info(f"  {symbol}: posición ya abierta — skip")
+        return
+
+    df    = calculate_indicators(get_ohlcv(public_ex, symbol, timeframe=timeframe))
+    t_sig = technical_signal(df)
+    m_sig = macd_signal(df)
+    v_sig = volume_signal(df)
+    h_sig = timeframe_confirm_signal(public_ex, symbol, timeframe)
+    n_sig = get_news_sentiment(symbol)
+
+    signals = {"tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig, "news": n_sig}
+    total   = sum(signals.values())
+
+    log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} VOL:{v_sig:+d} CONF:{h_sig:+d} NEWS:{n_sig:+d} = {total:+d}")
+
+    if abs(total) < MIN_SIGNALS:
+        log.info("  ⏭️  Señales insuficientes — skip")
+        return
+
+    usd_size, risk_pct = get_position_size(CAPITAL_TOTAL_USD, total)
+    log.info("  🧠 Consultando Claude...")
+    analysis = ask_claude(symbol, signals, df, fg_value, usd_size, risk_pct, timeframe)
+    log.info(f"  Claude: {analysis['action']} ({analysis['confidence']:.2f}) — {analysis['reasoning']}")
+
+    if not fear_greed_filter(fg_value, analysis["action"]): return
+
+    current_price = df.iloc[-1]["close"]
+    base_record = {
+        "timestamp": datetime.now().isoformat(), "symbol": symbol,
+        "action": analysis["action"], "confidence": analysis["confidence"],
+        "reasoning": analysis["reasoning"], "timeframe": timeframe,
+        "tech_signal": t_sig, "macd_signal": m_sig, "vol_signal": v_sig,
+        "tf4h_signal": h_sig, "news_signal": n_sig,
+        "fear_greed_value": fg_value, "fear_greed_label": fg_label,
+        "price": current_price, "usd_size": usd_size, "risk_pct": risk_pct,
+        "signal_score": total,
+    }
+
+    if analysis["action"] == "BUY" and analysis["confidence"] >= 0.6:
+        trail_stop  = round(current_price * (1 - TRAILING_STOP_PCT), 4)
+        take_profit = round(current_price * (1 + TAKE_PROFIT_PCT), 4)
+        if PAPER_TRADING:
+            save_trade({**base_record, "paper": True, "order_id": None})
+            open_position(symbol, current_price, usd_size, risk_pct, "BUY", timeframe)
+            log.info(f"  📝 PAPER BUY @ {current_price} | Trail={trail_stop} TP={take_profit}")
+            send_telegram(
+                f"📝 <b>PAPER BUY [{timeframe}]</b>\n"
+                f"Par: <b>{symbol}</b> @ {current_price}\n"
+                f"🔴 Trail: {trail_stop} | 🎯 TP: {take_profit}\n"
+                f"💰 ${usd_size} ({risk_pct*100:.0f}% — score {total:+d})\n"
+                f"Confianza: {int(analysis['confidence']*100)}% | F&G: {fg_value}"
+            )
+        else:
+            order, exec_price = execute_trade(trade_ex, symbol, "BUY", usd_size)
+            if order:
+                actual = exec_price or current_price
+                save_trade({**base_record, "paper": False, "order_id": order.get("id"), "price": actual})
+                open_position(symbol, actual, usd_size, risk_pct, "BUY", timeframe)
+                send_telegram(f"✅ <b>COMPRA [{timeframe}]</b> — {symbol} @ {actual}\n💰 ${usd_size} | Trail: {round(actual*(1-TRAILING_STOP_PCT),4)}")
+
+    elif analysis["action"] == "SELL" and analysis["confidence"] >= 0.6:
+        if PAPER_TRADING:
+            save_trade({**base_record, "paper": True, "order_id": None})
+            log.info(f"  📝 PAPER SELL @ {current_price}")
+        else:
+            order, exec_price = execute_trade(trade_ex, symbol, "SELL", usd_size)
+            if order:
+                save_trade({**base_record, "paper": False, "order_id": order.get("id")})
+
+# ─────────────────────────────────────────
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v3 iniciado")
-    log.info(f"Mode: {'PAPER TRADING' if PAPER_TRADING else 'REAL'}")
-    log.info(f"Trailing stop: {TRAILING_STOP_PCT*100}% | Take profit: {TAKE_PROFIT_PCT*100}%")
-    log.info(f"Position sizing: {POSITION_SIZE_MAP}")
+    log.info("🤖 CryptoBot v4 iniciado")
+    log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
+    log.info(f"Base: {BASE_WATCHLIST} [1h] + Top altcoins [3m scalping]")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v3 iniciado</b>\n"
-        f"Mode: {'📝 PAPER TRADING' if PAPER_TRADING else '💰 REAL'}\n"
-        f"Capital: ${CAPITAL_TOTAL_USD}\n"
-        f"Trailing stop: {TRAILING_STOP_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}%\n"
-        f"Position sizing: 2-5% según señales\n"
-        f"Pares: {', '.join(WATCHLIST)}"
+        f"🤖 <b>CryptoBot v4 iniciado</b>\n"
+        f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
+        f"Base 1h: {', '.join(s.replace('/USDT','') for s in BASE_WATCHLIST)}\n"
+        f"+ Top altcoins 3m (scalping)\n"
+        f"Trailing: {TRAILING_STOP_PCT*100}% | TP: {TAKE_PROFIT_PCT*100}% | Resumen: 9 AM"
     )
 
     public_ex = get_public_exchange()
     trade_ex  = get_trade_exchange()
+    altcoins  = []
+    last_scan = 0  # timestamp del último scan
 
     while True:
+        now = time.time()
         log.info(f"\n{'='*50}\n⏰ Ciclo: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # 1. Actualizar trailing stops de posiciones abiertas
+        # 1. Actualizar trailing stops
         update_trailing_stops(public_ex)
 
         # 2. Fear & Greed
         fg_value, fg_label = get_fear_greed()
         log.info(f"🧭 Fear & Greed: {fg_value} — {fg_label}")
 
-        # 3. Analizar cada par
+        # 3. Resumen diario
+        maybe_send_daily_report(fg_value, fg_label)
+
+        # 4. Scan altcoins cada 30 minutos
+        if now - last_scan > 600:  # re-scan cada 10 minutos
+            log.info("🔍 Escaneando top altcoins por volumen...")
+            altcoins  = scan_top_altcoins(public_ex, max_alts=8)
+            last_scan = now
+
         open_positions = load_positions()
+        log.info(f"📂 Posiciones abiertas: {list(open_positions.keys()) or 'ninguna'}")
 
-        for symbol in WATCHLIST:
+        # 5. Analizar base watchlist en 1h
+        log.info("\n--- BASE WATCHLIST [1h] ---")
+        for symbol in BASE_WATCHLIST:
             try:
-                # No abrir nueva posición si ya hay una abierta en este par
-                if symbol in open_positions:
-                    log.info(f"\n📊 {symbol}... ya tiene posición abierta, skip")
-                    continue
-
                 log.info(f"\n📊 {symbol}...")
-                df    = calculate_indicators(get_ohlcv(public_ex, symbol))
-                t_sig = technical_signal(df)
-                m_sig = macd_signal(df)
-                v_sig = volume_signal(df)
-                h_sig = timeframe_4h_signal(public_ex, symbol)
-                n_sig = get_news_sentiment(symbol)
-
-                signals = {"tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig, "news": n_sig}
-                total   = sum(signals.values())
-
-                log.info(f"  EMA:{t_sig:+d} MACD:{m_sig:+d} VOL:{v_sig:+d} 4H:{h_sig:+d} NEWS:{n_sig:+d} = {total:+d}")
-
-                if abs(total) < MIN_SIGNALS:
-                    log.info("  ⏭️  Señales insuficientes — skip")
-                    continue
-
-                # Position sizing dinámico
-                usd_size, risk_pct = get_position_size(CAPITAL_TOTAL_USD, total)
-
-                # Consultar Claude
-                log.info("  🧠 Consultando Claude...")
-                analysis = ask_claude(symbol, signals, df, fg_value, usd_size, risk_pct)
-                log.info(f"  Claude: {analysis['action']} ({analysis['confidence']:.2f}) — {analysis['reasoning']}")
-
-                # Filtro Fear & Greed
-                if not fear_greed_filter(fg_value, analysis["action"]):
-                    continue
-
-                current_price = df.iloc[-1]["close"]
-                trail_stop    = round(current_price * (1 - TRAILING_STOP_PCT), 4)
-                take_profit   = round(current_price * (1 + TAKE_PROFIT_PCT), 4)
-
-                base_record = {
-                    "timestamp":        datetime.now().isoformat(),
-                    "symbol":           symbol,
-                    "action":           analysis["action"],
-                    "confidence":       analysis["confidence"],
-                    "reasoning":        analysis["reasoning"],
-                    "tech_signal":      t_sig,
-                    "macd_signal":      m_sig,
-                    "vol_signal":       v_sig,
-                    "tf4h_signal":      h_sig,
-                    "news_signal":      n_sig,
-                    "fear_greed_value": fg_value,
-                    "fear_greed_label": fg_label,
-                    "price":            current_price,
-                    "trail_stop":       trail_stop,
-                    "take_profit":      take_profit,
-                    "usd_size":         usd_size,
-                    "risk_pct":         risk_pct,
-                    "signal_score":     total,
-                }
-
-                if analysis["action"] == "BUY" and analysis["confidence"] >= 0.6:
-                    if PAPER_TRADING:
-                        save_trade({**base_record, "paper": True, "order_id": None})
-                        open_position(symbol, current_price, usd_size, risk_pct, "BUY")
-                        log.info(f"  📝 PAPER BUY @ {current_price} | Trail={trail_stop} TP={take_profit} Size=${usd_size}")
-                        send_telegram(
-                            f"📝 <b>PAPER BUY</b>\n"
-                            f"Par: <b>{symbol}</b> @ {current_price} USDT\n"
-                            f"🔴 Trail Stop: {trail_stop}\n"
-                            f"🎯 Take Profit: {take_profit}\n"
-                            f"💰 Size: ${usd_size} ({risk_pct*100:.0f}% — score {total:+d})\n"
-                            f"Confianza: {int(analysis['confidence']*100)}%\n"
-                            f"F&G: {fg_value} — {analysis['reasoning']}"
-                        )
-                    else:
-                        order, exec_price = execute_trade(trade_ex, symbol, "BUY", usd_size)
-                        if order:
-                            actual_price = exec_price or current_price
-                            save_trade({**base_record, "paper": False, "order_id": order.get("id"), "price": actual_price})
-                            open_position(symbol, actual_price, usd_size, risk_pct, "BUY")
-                            send_telegram(
-                                f"✅ <b>COMPRA ejecutada</b>\n"
-                                f"Par: <b>{symbol}</b> @ {actual_price} USDT\n"
-                                f"🔴 Trail Stop: {round(actual_price*(1-TRAILING_STOP_PCT),4)}\n"
-                                f"🎯 Take Profit: {round(actual_price*(1+TAKE_PROFIT_PCT),4)}\n"
-                                f"💰 Size: ${usd_size} ({risk_pct*100:.0f}%)"
-                            )
-
-                elif analysis["action"] == "SELL" and analysis["confidence"] >= 0.6:
-                    if PAPER_TRADING:
-                        save_trade({**base_record, "paper": True, "order_id": None})
-                        log.info(f"  📝 PAPER SELL @ {current_price}")
-                        send_telegram(f"📝 <b>PAPER SELL</b>\nPar: <b>{symbol}</b> @ {current_price}\nConfianza: {int(analysis['confidence']*100)}%")
-                    else:
-                        order, exec_price = execute_trade(trade_ex, symbol, "SELL", usd_size)
-                        if order:
-                            save_trade({**base_record, "paper": False, "order_id": order.get("id")})
-                else:
-                    log.info("  🚫 HOLD")
-
+                analyze_and_trade(symbol, "1h", public_ex, trade_ex, fg_value, fg_label, open_positions)
             except Exception as e:
                 log.error(f"Error {symbol}: {e}")
+
+        # 6. Analizar altcoins en 15m
+        if altcoins:
+            log.info("\n--- ALTCOIN SCANNER [3m scalping] ---")
+            for symbol in altcoins:
+                try:
+                    log.info(f"\n📊 {symbol} [3m]...")
+                    analyze_and_trade(symbol, "3m", public_ex, trade_ex, fg_value, fg_label, open_positions)
+                except Exception as e:
+                    log.error(f"Error {symbol}: {e}")
 
         log.info(f"\n💤 Esperando {LOOP_INTERVAL_SEC}s...")
         time.sleep(LOOP_INTERVAL_SEC)
