@@ -33,6 +33,7 @@ MIN_SIGNALS       = 2
 LOOP_INTERVAL_SEC = 300
 WATCHLIST         = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 TRADE_LOG_FILE    = "trade_log.json"
+PAPER_TRADING     = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 
 # ─────────────────────────────────────────
 # DASHBOARD HTML
@@ -73,6 +74,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:.68rem;font-weight:700}
   .badge-buy{background:rgba(0,255,136,.12);color:var(--green);border:1px solid rgba(0,255,136,.2)}
   .badge-sell{background:rgba(255,51,85,.12);color:var(--red);border:1px solid rgba(255,51,85,.2)}
+  .badge-hold{background:rgba(61,81,102,.3);color:var(--muted);border:1px solid rgba(61,81,102,.5)}
+  .badge-paper{font-size:.55rem;background:rgba(0,170,255,.1);color:var(--blue);border:1px solid rgba(0,170,255,.2);padding:1px 5px;border-radius:3px;margin-left:4px}
   .confidence-bar{display:flex;align-items:center;gap:8px}
   .bar-bg{flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden}
   .bar-fill{height:100%;background:var(--green);border-radius:2px}
@@ -135,7 +138,7 @@ async function loadData(){
     }
     const tbody=document.getElementById('trades-body');
     if(!trades.length){tbody.innerHTML='<tr><td colspan="7"><div class="empty"><div class="empty-icon">🤖</div><div class="empty-text">El bot está analizando señales...<br>Las operaciones aparecerán aquí cuando se ejecuten.</div></div></td></tr>';return;}
-    tbody.innerHTML=[...trades].reverse().map(t=>{
+    tbody.innerHTML=[...trades].reverse().filter(t=>t.action!=='HOLD').concat([...trades].reverse().filter(t=>t.action==='HOLD').slice(0,5)).map(t=>{
       const ts=new Date(t.timestamp).toLocaleString('es-AR',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
       const conf=Math.round((t.confidence||0)*100);
       const signals=[];
@@ -464,26 +467,55 @@ def run_bot():
                 if not fear_greed_filter(fg_value, analysis["action"]):
                     continue
 
+                # Precio actual para paper trading
+                current_price = df.iloc[-1]["close"]
+                sl_price = round(current_price*(1-STOP_LOSS_PCT),4)
+                tp_price = round(current_price*(1+TAKE_PROFIT_PCT),4)
+
+                base_record = {
+                    "timestamp":        datetime.now().isoformat(),
+                    "symbol":           symbol,
+                    "action":           analysis["action"],
+                    "confidence":       analysis["confidence"],
+                    "reasoning":        analysis["reasoning"],
+                    "tech_signal":      t_sig,
+                    "macd_signal":      m_sig,
+                    "vol_signal":       v_sig,
+                    "tf4h_signal":      h_sig,
+                    "news_signal":      n_sig,
+                    "fear_greed_value": fg_value,
+                    "fear_greed_label": fg_label,
+                    "price":            current_price,
+                    "sl_price":         sl_price,
+                    "tp_price":         tp_price,
+                }
+
                 if analysis["action"] in ("BUY","SELL") and analysis["confidence"] >= 0.6:
-                    order = execute_trade(trade_ex, symbol, analysis["action"], CAPITAL_TOTAL_USD)
-                    if order:
-                        save_trade({
-                            "timestamp":      datetime.now().isoformat(),
-                            "symbol":         symbol,
-                            "action":         analysis["action"],
-                            "confidence":     analysis["confidence"],
-                            "reasoning":      analysis["reasoning"],
-                            "tech_signal":    t_sig,
-                            "macd_signal":    m_sig,
-                            "vol_signal":     v_sig,
-                            "tf4h_signal":    h_sig,
-                            "news_signal":    n_sig,
-                            "fear_greed_value": fg_value,
-                            "fear_greed_label": fg_label,
-                            "order_id":       order.get("id")
-                        })
+                    if PAPER_TRADING:
+                        # Paper trading: registrar sin ejecutar
+                        record = {**base_record, "paper": True, "order_id": None}
+                        save_trade(record)
+                        log.info(f"  📝 PAPER {analysis['action']} {symbol} @ {current_price} | SL={sl_price} TP={tp_price}")
+                        send_telegram(
+                            f"📝 <b>PAPER {analysis['action']}</b>
+"
+                            f"Par: <b>{symbol}</b>
+Precio: <b>{current_price} USDT</b>
+"
+                            f"SL: {sl_price} | TP: {tp_price}
+"
+                            f"Confianza: {int(analysis['confidence']*100)}%
+"
+                            f"F&G: {fg_value} | {analysis['reasoning']}"
+                        )
+                    else:
+                        order = execute_trade(trade_ex, symbol, analysis["action"], CAPITAL_TOTAL_USD)
+                        if order:
+                            save_trade({**base_record, "paper": False, "order_id": order.get("id")})
                 else:
                     log.info("  🚫 HOLD")
+                    # Registrar HOLDs también para análisis
+                    save_trade({**base_record, "paper": True, "order_id": None})
                     send_telegram(f"🚫 <b>HOLD {symbol}</b>\n{analysis['reasoning']}\nF&G: {fg_value}")
 
             except Exception as e:
@@ -498,3 +530,5 @@ def run_bot():
 if __name__ == "__main__":
     threading.Thread(target=run_dashboard, daemon=True).start()
     run_bot()
+
+# PATCH: this line intentionally left blank
