@@ -61,7 +61,7 @@ MIN_SIGNALS        = 2
 MIN_SIGNALS_SIDEWAYS = 3
 CONFIDENCE_MIN     = 0.50
 LOOP_INTERVAL_SEC  = 60
-MAX_CAPITAL_EXPOSURE = 0.20
+MAX_CAPITAL_EXPOSURE = 0.25  # 25% — con $500 permite posiciones más grandes
 MAX_WEEKLY_LOSS_PCT  = 0.10
 DRAWDOWN_REDUCE_PCT  = 0.50
 STOP_LOSS_PCT        = 0.03
@@ -251,12 +251,16 @@ _pending_entries = {}  # symbol → {signals, timestamp, df_snapshot}
 
 def check_entry_confirmation(symbol, signals_dict, df, timeframe):
     """
-    En vez de entrar inmediatamente, espera ENTRY_CONFIRM_CANDLES velas.
-    Si la señal sigue activa, ejecuta. Si no, cancela.
+    Espera confirmación antes de entrar, pero con tiempos razonables:
+    - 3m  → espera 3 min  (1 vela completa)
+    - 1h  → espera 5 min  (no 1h completa — demasiado conservador)
+    - 15m → espera 5 min
+    Si la señal sigue activa tras la espera, ejecuta. Si no, cancela.
     """
     now = time.time()
-    candle_seconds = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "1h": 3600}
-    wait_time = candle_seconds.get(timeframe, 180) * ENTRY_CONFIRM_CANDLES
+    # Tiempos de espera razonables — no bloquear 1h para entrar en 1h
+    confirm_wait = {"1m": 60, "3m": 180, "5m": 180, "15m": 300, "1h": 300}
+    wait_time = confirm_wait.get(timeframe, 180)
 
     if symbol not in _pending_entries:
         _pending_entries[symbol] = {"time": now, "signals": signals_dict.copy()}
@@ -1261,11 +1265,19 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} BB:{bb_sig:+d} OB:{ob_sig:+d} RSIDiv:{rsi_sig:+d} VOL:{v_sig:+d} FR:{fr_sig:+d} NEWS:{n_sig:+d} = {score_float:+.1f} (raw int={score_int:+d})")
 
     # Score mínimo dinámico (régimen + RL)
+    # Sideways: threshold float 2.5 — ADA +2.7 entra, DOGE +1.7 no entra
+    # Bull/Bear: threshold int 2 — más permisivo
     rl_min = rl_adjust_min_signals(state)
-    min_score = rl_min if regime == "sideways" else MIN_SIGNALS
-    if abs(score_int) < min_score:
-        log.info(f"  ⏭️  Score {score_int:+d} < mínimo {min_score} ({regime}) — skip")
-        return
+    if regime == "sideways":
+        min_float = 2.5
+        if abs(score_float) < min_float:
+            log.info(f"  ⏭️  Score {score_float:+.1f} < {min_float} (sideways) — skip")
+            return
+    else:
+        min_score = max(MIN_SIGNALS, rl_min - 1)
+        if abs(score_int) < min_score:
+            log.info(f"  ⏭️  Score {score_int:+d} < {min_score} ({regime}) — skip")
+            return
 
     if timeframe == "3m" and score_int < 0:
         log.info("  ⏭️  Bajista en 3m — skip")
