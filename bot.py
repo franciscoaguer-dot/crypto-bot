@@ -408,20 +408,66 @@ def check_drawdown(state):
     current    = state.get("capital", CAPITAL_TOTAL_USD)
     loss_pct   = (week_start - current) / week_start if week_start > 0 else 0
     now_arg    = datetime.now(ARG_TZ)
+
+    # ── Reset semanal (lunes) ──
     if now_arg.weekday() == 0:
         week_date = now_arg.strftime("%Y-%m-%d")
         if state.get("week_start_date") != week_date:
             state["week_start_capital"] = current
             state["week_start_date"]    = week_date
             state["drawdown_mode"]      = False
+            state["daily_drawdown_mode"] = False
+            state["day_start_capital"]  = current
+            state["day_start_date"]     = now_arg.strftime("%Y-%m-%d")
             state["rl_min_signals"]     = MIN_SIGNALS_SIDEWAYS
             log.info(f"📅 Reset semanal — capital base: ${current:.2f}")
+
+    # ── Reset diario ──
+    today = now_arg.strftime("%Y-%m-%d")
+    if state.get("day_start_date") != today:
+        state["day_start_capital"] = current
+        state["day_start_date"]    = today
+        state["daily_drawdown_mode"] = False
+        log.info(f"📅 Reset diario — capital base: ${current:.2f}")
+
+    # ── Drawdown diario > 3% → pausar hasta mañana ──
+    day_start = state.get("day_start_capital", current)
+    daily_loss = (day_start - current) / day_start if day_start > 0 else 0
+    if daily_loss > 0.03 and not state.get("daily_drawdown_mode"):
+        state["daily_drawdown_mode"] = True
+        send_telegram(f"🛑 <b>DAILY CIRCUIT BREAKER</b>\nPérdida diaria: {daily_loss*100:.1f}%\nSin nuevas entradas hasta mañana")
+        log.info(f"🛑 Circuit breaker diario — pérdida {daily_loss*100:.1f}%")
+    elif daily_loss <= 0.01 and state.get("daily_drawdown_mode"):
+        state["daily_drawdown_mode"] = False
+
+    # ── Drawdown semanal ──
     if loss_pct > MAX_WEEKLY_LOSS_PCT and not state.get("drawdown_mode"):
         state["drawdown_mode"] = True
         send_telegram(f"⚠️ <b>DRAWDOWN MODE</b>\nPérdida semanal: {loss_pct*100:.1f}%\nSizing reducido 50%")
     elif loss_pct <= MAX_WEEKLY_LOSS_PCT * 0.5 and state.get("drawdown_mode"):
         state["drawdown_mode"] = False
     save_state(state)
+
+
+def trading_hours_filter() -> bool:
+    """No operar entre 00:00 y 06:00 UTC — volumen bajo, spreads amplios."""
+    hour_utc = datetime.utcnow().hour
+    if 0 <= hour_utc < 6:
+        log.info(f"  ⏭️  Hora UTC {hour_utc:02d}:xx — fuera de horario (00-06 UTC)")
+        return False
+    return True
+
+
+def losing_positions_filter(open_positions: dict) -> bool:
+    """No abrir nuevas posiciones si ya hay 2 o más en pérdida simultánea."""
+    losing = [s for s, p in open_positions.items()
+              if p.get("current_price") and p.get("entry_price") and
+              ((p["action"] == "BUY"  and p["current_price"] < p["entry_price"]) or
+               (p["action"] == "SELL" and p["current_price"] > p["entry_price"]))]
+    if len(losing) >= 2:
+        log.info(f"  ⏭️  {len(losing)} posiciones en pérdida ({', '.join(losing)}) — no abrir más")
+        return False
+    return True
 
 # ─────────────────────────────────────────
 # FLASK DASHBOARD
@@ -601,6 +647,18 @@ footer{text-align:center;font-size:9px;color:var(--text2);padding-top:12px;borde
     </div>
   </div>
 </div>
+
+<!-- FILTROS + LOGS -->
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">Estado de filtros</span><span id="filter-time" style="font-size:10px;color:var(--text2)"></span></div>
+    <div style="padding:10px 14px;display:flex;flex-direction:column;gap:6px" id="filter-status"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head"><span class="panel-title">Actividad del bot</span><span style="font-size:10px;color:var(--text2)">últimas 20 líneas</span></div>
+    <div id="live-log" style="padding:8px 14px;font-size:10px;font-family:var(--font-mono);color:var(--text2);max-height:200px;overflow-y:auto;display:flex;flex-direction:column;gap:2px"></div>
+  </div>
+</div>
 <div style="background:var(--s2);border:1px solid var(--border);border-radius:6px 6px 0 0;padding:9px 14px">
   <span style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:var(--text2);font-weight:600">Historial de trades</span>
 </div>
@@ -723,6 +781,42 @@ async function load(){
     // Scanner
     const sc=d.scanner||[];
     document.getElementById('scanner-row').innerHTML=sc.map(s=>{const b=['BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT'].includes(s.symbol);const v=s.volume?'<span style="color:var(--text2);font-size:9px"> $'+Math.round(s.volume/1e6)+'M</span>':'';return '<span class="chip '+(b?'base':'alt')+'">'+s.symbol.replace('/USDT','')+v+'</span>';}).join('');
+
+    // Filtros
+    const fl=d.filters||{};
+    const now_utc=new Date().getUTCHours();
+    const trading_hours=!(now_utc>=0&&now_utc<6);
+    const filterDefs=[
+      {key:'btc_macro',   label:'BTC 4h Macro',       ok:fl.btc_macro===true,  warn:fl.btc_macro===false,  okTxt:'Alcista ↑ — LONG OK',     warnTxt:'Bajista ↓ — LONG bloqueado', unkTxt:'Calculando...'},
+      {key:'daily',       label:'Circuit Breaker',     ok:!fl.daily_circuit,    warn:fl.daily_circuit,      okTxt:'OK — Sin límite diario',   warnTxt:'🛑 ACTIVO — Sin entradas hoy', unkTxt:'—'},
+      {key:'weekly',      label:'Drawdown Semanal',    ok:!fl.weekly_drawdown,  warn:fl.weekly_drawdown,    okTxt:'OK — Dentro del límite',   warnTxt:'⚠️ ACTIVO — Sizing reducido', unkTxt:'—'},
+      {key:'hours',       label:'Horario (UTC)',       ok:trading_hours,        warn:!trading_hours,        okTxt:'Mercado activo',           warnTxt:'00-06 UTC — Sin entradas', unkTxt:'—'},
+    ];
+    document.getElementById('filter-status').innerHTML=filterDefs.map(f=>{
+      const isOk=f.ok; const isWarn=f.warn;
+      const color=isWarn?'var(--red)':isOk?'var(--green)':'var(--text2)';
+      const dot=isWarn?'🔴':isOk?'🟢':'⚪';
+      const txt=isWarn?f.warnTxt:isOk?f.okTxt:f.unkTxt;
+      return '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--text2)">'+f.label+'</span><span style="font-size:10px;color:'+color+'">'+dot+' '+txt+'</span></div>';
+    }).join('');
+    document.getElementById('filter-time').textContent='UTC '+String(now_utc).padStart(2,'0')+':xx';
+
+    // Live log
+    try{
+      const logs=await fetch('/api/log').then(r=>r.json());
+      const logEl=document.getElementById('live-log');
+      logEl.innerHTML=logs.slice(-20).map(l=>{
+        const msg=l.msg||'';
+        const color=msg.includes('ERROR')||msg.includes('❌')?'var(--red)':
+                    msg.includes('✅')||msg.includes('🟢')||msg.includes('+%')?'var(--green)':
+                    msg.includes('⏭️')||msg.includes('skip')?'var(--text2)':
+                    msg.includes('⏳')||msg.includes('confirmando')?'var(--yellow)':
+                    msg.includes('🔴 TRAIL')||msg.includes('STOP')?'var(--orange)':'var(--text)';
+        return '<div style="color:'+color+';line-height:1.4">'+msg+'</div>';
+      }).join('');
+      logEl.scrollTop=logEl.scrollHeight;
+    }catch(e){}
+
     // Table
     const tb=document.getElementById('tbody');
     if(!trades.length){tb.innerHTML='<tr><td colspan="11"><div class="empty-row">🤖 Sin trades aún. El bot está aprendiendo...</div></td></tr>';return;}
@@ -760,6 +854,26 @@ _regime     = "unknown"
 @flask_app.route("/")
 def index(): return render_template_string(DASHBOARD_HTML)
 
+# ── Live log buffer ──────────────────────────────────────────────────────────
+import collections
+_log_buffer = collections.deque(maxlen=30)
+
+class LogBufferHandler(logging.Handler):
+    def emit(self, record):
+        msg = self.format(record)
+        # strip ANSI codes
+        import re
+        msg = re.sub(r'\[[0-9;]*m', '', msg)
+        _log_buffer.append({"ts": record.created, "msg": msg[-200:]})
+
+_log_buf_handler = LogBufferHandler()
+_log_buf_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+logging.getLogger("bot").addHandler(_log_buf_handler)
+
+@flask_app.route("/api/log")
+def api_log():
+    return jsonify(list(_log_buffer))
+
 @flask_app.route("/api/trades")
 def api_trades():
     trades = []
@@ -777,6 +891,7 @@ def api_trades():
     positions = load_positions()
     state     = load_state()
     weights   = _weights_cache if _weights_cache else DEFAULT_WEIGHTS
+    btc_macro = _btc_macro_cache.get("value")
     return jsonify({
         "trades": trades, "count": len(trades),
         "fear_greed": _fear_greed,
@@ -785,6 +900,11 @@ def api_trades():
         "regime": _regime,
         "state": state,
         "weights": weights,
+        "filters": {
+            "btc_macro": btc_macro,          # True=alcista, False=bajista, None=desconocido
+            "daily_circuit": state.get("daily_drawdown_mode", False),
+            "weekly_drawdown": state.get("drawdown_mode", False),
+        },
     })
 
 @flask_app.route("/health")
@@ -1231,7 +1351,13 @@ def open_position(symbol, entry_price, usd_size, pct, action, timeframe, mode, s
         mult      = ATR_MULTIPLIER_FUT if is_futures else ATR_MULTIPLIER_SPOT
         trail_abs = atr_value * mult
         trail_pct_actual = trail_abs / entry_price
-        log.info(f"  📐 ATR trailing: {atr_value:.4f} × {mult} = {trail_abs:.4f} ({trail_pct_actual*100:.2f}%)")
+        # Cap: 3% max en 3m altcoins, 2% max en futuros, 4% max en 1h spot
+        max_trail = 0.02 if is_futures else (0.03 if timeframe == "3m" else 0.04)
+        if trail_pct_actual > max_trail:
+            log.info(f"  📐 ATR trailing: {atr_value:.4f} × {mult} = {trail_abs:.4f} ({trail_pct_actual*100:.2f}%) → capped a {max_trail*100:.0f}%")
+            trail_pct_actual = max_trail
+        else:
+            log.info(f"  📐 ATR trailing: {atr_value:.4f} × {mult} = {trail_abs:.4f} ({trail_pct_actual*100:.2f}%)")
     else:
         trail_pct_actual = FUTURES_TRAILING if is_futures else TRAILING_STOP_PCT
 
@@ -1518,6 +1644,95 @@ def save_trade(record):
         data.append(record)
         with open(TRADE_LOG_FILE,"w") as f: json.dump(data, f, indent=2, default=str)
 
+
+# ─────────────────────────────────────────
+# FILTROS DE CALIDAD DE ENTRADA
+# ─────────────────────────────────────────
+
+_btc_macro_cache = {"value": None, "ts": 0}
+
+def btc_macro_filter(exchange, direction: str) -> bool:
+    """
+    Filtro macro: solo abrir LONG si BTC 4h está por encima de EMA21.
+    Solo abrir SHORT si BTC 4h está por debajo de EMA21.
+    Evita entrar en contra de la tendencia mayor.
+    Cache de 15 minutos para no spammear la API.
+    """
+    global _btc_macro_cache
+    now = time.time()
+    if now - _btc_macro_cache["ts"] < 900 and _btc_macro_cache["value"] is not None:
+        btc_above_ema = _btc_macro_cache["value"]
+    else:
+        try:
+            df4h = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "4h", limit=30))
+            last = df4h.iloc[-1]
+            btc_above_ema = float(last["close"]) > float(last["ema21"])
+            _btc_macro_cache = {"value": btc_above_ema, "ts": now}
+            trend = "↑ BULL" if btc_above_ema else "↓ BEAR"
+            log.info(f"  🌍 BTC 4h macro: {trend} (close={last['close']:.0f} vs EMA21={last['ema21']:.0f})")
+        except Exception as e:
+            log.warning(f"  BTC macro filter error: {e}")
+            return True  # si falla, no bloquear
+
+    if direction == "LONG" and not btc_above_ema:
+        log.info("  ⏭️  Macro filter: BTC 4h bajista — no abrir LONG")
+        return False
+    if direction == "SHORT" and btc_above_ema:
+        log.info("  ⏭️  Macro filter: BTC 4h alcista — no abrir SHORT")
+        return False
+    return True
+
+
+def pump_dump_filter(df: pd.DataFrame, symbol: str, fr_val: float) -> bool:
+    """
+    Detecta pumps artificiales y condiciones de baja liquidez.
+    Retorna False si NO se debe entrar.
+
+    Condiciones de rechazo:
+    - Precio subió/bajó >8% en las últimas 4 velas → pump/dump en curso
+    - Funding extremo en altcoin desconocida (>0.5% o <-0.5%)
+    - Volatilidad ATR >5% del precio → mercado demasiado errático
+    """
+    last  = df.iloc[-1]
+    prev4 = df.iloc[-5] if len(df) >= 5 else df.iloc[0]
+
+    # Movimiento extremo en 4 velas
+    pct_move = abs(float(last["close"]) - float(prev4["close"])) / float(prev4["close"])
+    if pct_move > 0.08:
+        log.info(f"  ⏭️  Pump/dump filter: movimiento {pct_move*100:.1f}% en 4 velas — skip")
+        return False
+
+    # Funding extremo en altcoins (no en majors)
+    is_major = any(symbol.startswith(m) for m in ["BTC", "ETH", "SOL", "BNB"])
+    if not is_major and abs(fr_val) > 0.005:  # >0.5%
+        log.info(f"  ⏭️  Pump/dump filter: funding extremo {fr_val*100:.2f}% en altcoin — skip")
+        return False
+
+    # ATR demasiado alto — volatilidad extrema
+    if not pd.isna(last.get("atr", float("nan"))):
+        atr_pct = float(last["atr"]) / float(last["close"])
+        if atr_pct > 0.05:
+            log.info(f"  ⏭️  Pump/dump filter: ATR {atr_pct*100:.1f}% — volatilidad extrema, skip")
+            return False
+
+    return True
+
+
+def volume_conviction_filter(df: pd.DataFrame) -> bool:
+    """
+    Requiere que la vela de señal tenga volumen ≥ 1.5x el promedio de 20 velas.
+    Una señal con volumen bajo puede ser ruido — sin convicción del mercado.
+    """
+    last = df.iloc[-1]
+    if pd.isna(last.get("vol_ma20", float("nan"))) or last["vol_ma20"] == 0:
+        return True  # sin datos, no bloquear
+    ratio = float(last["volume"]) / float(last["vol_ma20"])
+    if ratio < 1.5:
+        log.info(f"  ⏭️  Volume conviction: {ratio:.1f}x promedio — señal sin convicción, skip")
+        return False
+    log.info(f"  ✅ Volume conviction: {ratio:.1f}x promedio")
+    return True
+
 # ─────────────────────────────────────────
 # ANALIZAR UN PAR — motor principal
 # ─────────────────────────────────────────
@@ -1577,6 +1792,28 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     open_alts    = [s for s in open_positions if s not in base_symbols]
     if symbol not in base_symbols and len(open_alts) >= MAX_CORRELATION_ALTS:
         log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas — skip")
+        return
+
+    # ── Filtro 0: Circuit breakers globales ─────────────────────────────────
+    if state.get("daily_drawdown_mode"):
+        log.info("  ⏭️  Daily circuit breaker activo — skip")
+        return
+    if not trading_hours_filter():
+        return
+    if not losing_positions_filter(open_positions):
+        return
+
+    # ── Filtro 1: Macro BTC 4h ──────────────────────────────────────────────
+    direction_macro = "LONG" if score_float > 0 else "SHORT"
+    if not btc_macro_filter(public_ex, direction_macro):
+        return
+
+    # ── Filtro 2: Pump/dump y liquidez ───────────────────────────────────────
+    if not pump_dump_filter(df, symbol, fr_val):
+        return
+
+    # ── Filtro 3: Volumen de convicción ──────────────────────────────────────
+    if not volume_conviction_filter(df):
         return
 
     # Entry confirmation delay
@@ -1680,13 +1917,13 @@ def run_bot():
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v9 — Self-Learning</b>\n"
+        f"🤖 <b>CryptoBot v10 — Aggressive Self-Learning</b>\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
-        f"✨ Dynamic Weights — aprende de cada trade\n"
-        f"⏳ Entry confirmation delay: {ENTRY_CONFIRM_CANDLES} vela(s)\n"
-        f"½ Partial exit al {TAKE_PROFIT_PARTIAL*100}% | 🛑 SL {STOP_LOSS_PCT*100}%\n"
-        f"🤖 RL: ajuste automático de min_signals\n"
-        f"Spot trail {TRAILING_STOP_PCT*100}% | Futuros {FUTURES_LEVERAGE}x (score≥{FUTURES_MIN_SCORE})"
+        f"💾 Persistencia: PostgreSQL\n"
+        f"🌍 Filtro macro BTC 4h | 🛡️ Pump/dump filter\n"
+        f"📊 Volume conviction | 🛑 Circuit breaker diario\n"
+        f"⏰ Sin trading 00-06 UTC | 📉 Max 2 posiciones en pérdida\n"
+        f"Spot trail {TRAILING_STOP_PCT*100}% (ATR cap 3%) | Futuros {FUTURES_LEVERAGE}x"
     )
 
     public_ex  = get_public_exchange()
