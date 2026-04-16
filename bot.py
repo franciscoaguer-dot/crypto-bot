@@ -86,17 +86,79 @@ ATR_PERIOD             = 14      # período ATR para trailing dinámico
 ATR_MULTIPLIER_SPOT    = 1.5     # trailing = ATR * multiplier (spot)
 ATR_MULTIPLIER_FUT     = 1.0     # trailing = ATR * multiplier (futuros)
 SIDEWAYS_MIN_FLOAT     = 2.0     # bajado de 2.5 a 2.0 — más entradas
-SIGNAL_MEMORY_FILE   = "signal_memory.json"
-DYNAMIC_WEIGHTS_FILE = "dynamic_weights.json"
 WEIGHTS_UPDATE_INTERVAL = 3600   # recalcular pesos cada 1h
 MIN_SAMPLES_FOR_WEIGHT  = 5      # mínimo trades para confiar en un peso
 RL_STREAK_THRESHOLD     = 3      # 3 pérdidas seguidas → subir MIN_SIGNALS
 ENTRY_CONFIRM_CANDLES   = 1      # esperar N velas de confirmación antes de entrar
 PARTIAL_EXIT_PCT        = 0.50   # cerrar 50% al TP parcial
 
-TRADE_LOG_FILE   = "trade_log.json"
-POSITIONS_FILE   = "positions.json"
-STATE_FILE       = "bot_state.json"
+# ── Persistencia PostgreSQL ───────────────────────────────────────────────────
+# Si DATABASE_URL existe (Railway Postgres) → datos sobreviven redeploys.
+# Si no → fallback a archivos JSON locales (se pierden en redeploy).
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+if DATABASE_URL:
+    try:
+        import psycopg2, psycopg2.extras
+        _pg = psycopg2.connect(DATABASE_URL, sslmode="require")
+        _pg.autocommit = True
+        # Crear tablas si no existen
+        with _pg.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS kv_store (
+                    key   TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE TABLE IF NOT EXISTS trades (
+                    id         SERIAL PRIMARY KEY,
+                    data       JSONB NOT NULL,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+        import logging as _l; _l.getLogger("bot").info("💾 Persistencia: PostgreSQL ✅")
+        _USE_PG = True
+    except Exception as _pg_err:
+        import logging as _l; _l.getLogger("bot").warning(f"⚠️  PostgreSQL no disponible ({_pg_err}) — usando archivos JSON")
+        _pg = None; _USE_PG = False
+else:
+    import logging as _l; _l.getLogger("bot").warning("⚠️  DATABASE_URL no encontrada — usando archivos JSON (datos se pierden en redeploy)")
+    _pg = None; _USE_PG = False
+
+def _pg_get(key: str, default=None):
+    """Lee un valor JSON de PostgreSQL."""
+    try:
+        with _pg.cursor() as cur:
+            cur.execute("SELECT value FROM kv_store WHERE key=%s", (key,))
+            row = cur.fetchone()
+            return json.loads(row[0]) if row else default
+    except Exception as e:
+        log.warning(f"PG get error ({key}): {e}")
+        return default
+
+def _pg_set(key: str, value) -> bool:
+    """Escribe un valor JSON en PostgreSQL."""
+    try:
+        with _pg.cursor() as cur:
+            cur.execute("""
+                INSERT INTO kv_store (key, value, updated_at)
+                VALUES (%s, %s, NOW())
+                ON CONFLICT (key) DO UPDATE
+                SET value=EXCLUDED.value, updated_at=NOW()
+            """, (key, json.dumps(value, default=str)))
+        return True
+    except Exception as e:
+        log.warning(f"PG set error ({key}): {e}")
+        return False
+
+# Rutas de fallback JSON
+DATA_DIR             = "/data" if os.path.isdir("/data") else "."
+SIGNAL_MEMORY_FILE   = f"{DATA_DIR}/signal_memory.json"
+DYNAMIC_WEIGHTS_FILE = f"{DATA_DIR}/dynamic_weights.json"
+TRADE_LOG_FILE       = f"{DATA_DIR}/trade_log.json"
+POSITIONS_FILE       = f"{DATA_DIR}/positions.json"
+STATE_FILE           = f"{DATA_DIR}/bot_state.json"
 
 BASE_WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 EXCLUDE_SYMBOLS = {
@@ -109,6 +171,8 @@ ARG_TZ = timezone(timedelta(hours=-3))
 # SIGNAL MEMORY — el cerebro del aprendizaje
 # ─────────────────────────────────────────
 def load_signal_memory():
+    if _USE_PG:
+        return _pg_get("signal_memory", {})
     if os.path.exists(SIGNAL_MEMORY_FILE):
         try:
             with open(SIGNAL_MEMORY_FILE) as f: return json.load(f)
@@ -116,10 +180,6 @@ def load_signal_memory():
     return {}
 
 def save_signal_to_memory(signals_dict, pnl_pct, regime):
-    """
-    Guarda el resultado de un trade asociado a las señales activas.
-    Esto alimenta el sistema de aprendizaje.
-    """
     memory = load_signal_memory()
     sig_names = ["tech","macd","bb","ob","rsi_div","vol","funding","news","tf4h"]
     for sig in sig_names:
@@ -130,12 +190,12 @@ def save_signal_to_memory(signals_dict, pnl_pct, regime):
             memory[key] = {"wins": 0, "losses": 0, "total_pnl": 0.0, "count": 0}
         memory[key]["count"] += 1
         memory[key]["total_pnl"] = round(memory[key]["total_pnl"] + pnl_pct, 4)
-        if pnl_pct > 0:
-            memory[key]["wins"] += 1
-        else:
-            memory[key]["losses"] += 1
-    with open(SIGNAL_MEMORY_FILE, "w") as f:
-        json.dump(memory, f, indent=2)
+        if pnl_pct > 0: memory[key]["wins"] += 1
+        else:           memory[key]["losses"] += 1
+    if _USE_PG:
+        _pg_set("signal_memory", memory)
+    else:
+        with open(SIGNAL_MEMORY_FILE, "w") as f: json.dump(memory, f, indent=2)
 
 # ─────────────────────────────────────────
 # DYNAMIC WEIGHTS — ponderación por historial
@@ -193,8 +253,11 @@ def recalculate_weights(regime):
     _weights_cache = weights
     _weights_last_update = now
 
-    with open(DYNAMIC_WEIGHTS_FILE, "w") as f:
-        json.dump({"weights": weights, "updated": datetime.now().isoformat(), "regime": regime}, f, indent=2)
+    if _USE_PG:
+        _pg_set("dynamic_weights", {"weights": weights, "updated": datetime.now().isoformat(), "regime": regime})
+    else:
+        with open(DYNAMIC_WEIGHTS_FILE, "w") as f:
+            json.dump({"weights": weights, "updated": datetime.now().isoformat(), "regime": regime}, f, indent=2)
 
     if updated:
         log.info(f"  🧠 Pesos actualizados: {' | '.join(updated)}")
@@ -306,11 +369,7 @@ def check_entry_confirmation(symbol, signals_dict, df, timeframe):
 # STATE
 # ─────────────────────────────────────────
 def load_state():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE) as f: return json.load(f)
-        except: pass
-    return {
+    default = {
         "capital": CAPITAL_TOTAL_USD,
         "week_start_capital": CAPITAL_TOTAL_USD,
         "week_start_date": datetime.now(ARG_TZ).strftime("%Y-%m-%d"),
@@ -318,9 +377,19 @@ def load_state():
         "last_backtest": None,
         "rl_min_signals": MIN_SIGNALS_SIDEWAYS,
     }
+    if _USE_PG:
+        return _pg_get("bot_state", default)
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f: return json.load(f)
+        except: pass
+    return default
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2, default=str)
+    if _USE_PG:
+        _pg_set("bot_state", state)
+    else:
+        with open(STATE_FILE, "w") as f: json.dump(state, f, indent=2, default=str)
 
 def get_effective_capital(state):
     cap = state.get("capital", CAPITAL_TOTAL_USD)
@@ -694,7 +763,14 @@ def index(): return render_template_string(DASHBOARD_HTML)
 @flask_app.route("/api/trades")
 def api_trades():
     trades = []
-    if os.path.exists(TRADE_LOG_FILE):
+    if _USE_PG:
+        try:
+            with _pg.cursor() as cur:
+                cur.execute("SELECT data FROM trades ORDER BY created_at ASC")
+                trades = [row[0] for row in cur.fetchall()]
+        except Exception as e:
+            log.warning(f"PG api_trades error: {e}")
+    elif os.path.exists(TRADE_LOG_FILE):
         try:
             with open(TRADE_LOG_FILE) as f: trades = json.load(f)
         except: pass
@@ -1131,6 +1207,8 @@ def can_open_position(positions, new_size, effective_capital):
 # POSICIONES — TRAILING STOP + SALIDA PARCIAL
 # ─────────────────────────────────────────
 def load_positions():
+    if _USE_PG:
+        return _pg_get("positions", {})
     if os.path.exists(POSITIONS_FILE):
         try:
             with open(POSITIONS_FILE) as f: return json.load(f)
@@ -1138,7 +1216,10 @@ def load_positions():
     return {}
 
 def save_positions(positions):
-    with open(POSITIONS_FILE, "w") as f: json.dump(positions, f, indent=2, default=str)
+    if _USE_PG:
+        _pg_set("positions", positions)
+    else:
+        with open(POSITIONS_FILE, "w") as f: json.dump(positions, f, indent=2, default=str)
 
 def open_position(symbol, entry_price, usd_size, pct, action, timeframe, mode, signals_snap, atr_value=None):
     positions = load_positions()
@@ -1416,11 +1497,26 @@ def execute_futures_trade(futures_ex, symbol, action, usd_size, leverage=FUTURES
         return None, None
 
 def save_trade(record):
-    data = []
-    if os.path.exists(TRADE_LOG_FILE):
-        with open(TRADE_LOG_FILE) as f: data = json.load(f)
-    data.append(record)
-    with open(TRADE_LOG_FILE,"w") as f: json.dump(data, f, indent=2, default=str)
+    if _USE_PG:
+        try:
+            with _pg.cursor() as cur:
+                cur.execute("INSERT INTO trades (data) VALUES (%s)", (json.dumps(record, default=str),))
+        except Exception as e:
+            log.warning(f"PG save_trade error: {e}")
+            # fallback a JSON
+            data = []
+            if os.path.exists(TRADE_LOG_FILE):
+                try:
+                    with open(TRADE_LOG_FILE) as f: data = json.load(f)
+                except: pass
+            data.append(record)
+            with open(TRADE_LOG_FILE,"w") as f: json.dump(data, f, indent=2, default=str)
+    else:
+        data = []
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE) as f: data = json.load(f)
+        data.append(record)
+        with open(TRADE_LOG_FILE,"w") as f: json.dump(data, f, indent=2, default=str)
 
 # ─────────────────────────────────────────
 # ANALIZAR UN PAR — motor principal
