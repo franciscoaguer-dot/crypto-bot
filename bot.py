@@ -204,10 +204,20 @@ _weights_cache = {}
 _weights_last_update = 0
 
 DEFAULT_WEIGHTS = {
+    # señales originales
     "tech": 1.0, "macd": 1.0, "bb": 1.0, "ob": 1.0,
     "rsi_div": 1.0, "vol": 0.8, "funding": 1.0,
-    "news": 0.5,   # bajado: RSS no es confiable para altcoins pequeñas
-    "tf4h": 0.6,   # bajado: 15m EMA estaba bajando el score de BIO innecesariamente
+    "news": 0.5, "tf4h": 0.6,
+    # nuevas señales técnicas
+    "vwap": 1.2,        # VWAP — muy respetado por institucionales
+    "supertrend": 1.3,  # Supertrend — excelente filtro de tendencia
+    "stoch_rsi": 0.8,   # Stochastic RSI — momentum oscilador
+    "williams_r": 0.7,  # Williams %R — sobrecompra/sobreventa
+    "cci": 0.7,         # CCI — commodity channel index
+    "squeeze": 1.2,     # Squeeze release — explosión de precio inminente
+    "support_res": 1.0, # Soporte/Resistencia — niveles clave
+    "candle": 1.1,      # Patrones de velas — confirmación visual
+    "trend_struct": 0.9, # HH/LL — estructura de tendencia
 }
 
 def recalculate_weights(regime):
@@ -542,7 +552,7 @@ header{display:flex;align-items:center;justify-content:space-between;padding-bot
 .pos-bar{height:2px;background:var(--border2);border-radius:1px;margin-top:7px;overflow:hidden}
 .pos-bar-fill{height:100%;background:linear-gradient(90deg,var(--orange),var(--yellow));border-radius:1px}
 .pos-time{font-size:9px;color:var(--text2);margin-top:4px}
-.heatmap{display:grid;grid-template-columns:repeat(9,1fr);gap:3px;padding:10px 14px}
+.heatmap{display:grid;grid-template-columns:repeat(9,1fr);gap:3px;padding:10px 14px;flex-wrap:wrap}
 .sig-cell{padding:5px 3px;border-radius:4px;text-align:center;border:1px solid var(--border)}
 .sig-cell .sig-name{font-size:8px;color:var(--text2);letter-spacing:.05em}
 .sig-cell .sig-count{font-family:var(--font-sans);font-weight:700;font-size:15px;margin:2px 0}
@@ -644,6 +654,10 @@ footer{text-align:center;font-size:9px;color:var(--text2);padding-top:12px;borde
     <div class="panel">
       <div class="panel-head"><span class="panel-title">Scanner activo</span></div>
       <div class="scanner-row" id="scanner-row"></div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <div class="panel-head"><span class="panel-title">Indicadores técnicos activos</span><span style="font-size:10px;color:var(--text2)">última posición abierta</span></div>
+      <div id="tech-indicators" style="padding:10px 14px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px"></div>
     </div>
   </div>
 </div>
@@ -753,7 +767,14 @@ async function load(){
     }
     // Heatmap
     const rec=closed.slice(-20);
-    const sdefs=[{k:'tech',n:'EMA'},{k:'macd',n:'MACD'},{k:'bb',n:'BB'},{k:'ob',n:'OB'},{k:'vol',n:'VOL'},{k:'funding',n:'FR'},{k:'news',n:'NEWS'},{k:'rsi_div',n:'RSI▲'},{k:'tf4h',n:'CONF'}];
+    const sdefs=[
+      {k:'tech',n:'EMA'},{k:'macd',n:'MACD'},{k:'bb',n:'BB'},{k:'ob',n:'OB'},
+      {k:'vol',n:'VOL'},{k:'funding',n:'FR'},{k:'news',n:'NEWS'},{k:'rsi_div',n:'RSI▲'},
+      {k:'tf4h',n:'CONF'},{k:'vwap',n:'VWAP'},{k:'supertrend',n:'STRND'},
+      {k:'stoch_rsi',n:'STOCH'},{k:'williams_r',n:'WILLY'},{k:'cci',n:'CCI'},
+      {k:'squeeze',n:'SQZ'},{k:'support_res',n:'S/R'},{k:'candle',n:'CNDLE'},
+      {k:'trend_struct',n:'TREND'}
+    ];
     document.getElementById('sig-heatmap').innerHTML=sdefs.map(s=>{
       const hits=rec.filter(t=>t[s.k+'_signal']===1||t[s.k+'_signal']===-1||t[s.k]);
       const ws=hits.filter(t=>(t.pnl_pct||0)>0);
@@ -800,6 +821,36 @@ async function load(){
       return '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--border)"><span style="font-size:10px;color:var(--text2)">'+f.label+'</span><span style="font-size:10px;color:'+color+'">'+dot+' '+txt+'</span></div>';
     }).join('');
     document.getElementById('filter-time').textContent='UTC '+String(now_utc).padStart(2,'0')+':xx';
+
+    // Tech indicators panel — muestra estado de todos los indicadores de la última posición
+    const techPanel=document.getElementById('tech-indicators');
+    if(pos.length>0){
+      const p=pos[0];
+      const snap=p.signals_snap||{};
+      const indDefs=[
+        {k:'vwap',      n:'VWAP',      desc:'Precio vs VWAP'},
+        {k:'supertrend',n:'Supertrend',desc:'Tendencia macro'},
+        {k:'stoch_rsi', n:'Stoch RSI', desc:'Momentum oscilador'},
+        {k:'williams_r',n:'Williams %R',desc:'Sobrecompra/venta'},
+        {k:'cci',       n:'CCI',       desc:'Canal commodity'},
+        {k:'squeeze',   n:'Squeeze',   desc:'Explosión precio'},
+        {k:'support_res',n:'S/R',      desc:'Sop./Resistencia'},
+        {k:'candle',    n:'Velas',     desc:'Patrón de velas'},
+        {k:'trend_struct',n:'Estructura',desc:'HH/LL tendencia'},
+        {k:'tech',      n:'EMA Cross', desc:'Cruce EMA 9/21'},
+        {k:'macd',      n:'MACD',      desc:'Histograma MACD'},
+        {k:'bb',        n:'Bollinger', desc:'Bandas Bollinger'},
+      ];
+      techPanel.innerHTML=indDefs.map(d=>{
+        const v=snap[d.k]||0;
+        const color=v>0?'var(--green)':v<0?'var(--red)':'var(--text2)';
+        const icon=v>0?'↑':v<0?'↓':'—';
+        const bg=v>0?'rgba(13,255,176,.05)':v<0?'rgba(255,51,102,.05)':'var(--s2)';
+        return '<div style="background:'+bg+';border:1px solid var(--border);border-radius:4px;padding:6px 8px"><div style="font-size:9px;color:var(--text2)">'+d.n+'</div><div style="font-size:11px;color:'+color+';font-weight:700">'+icon+' '+d.desc+'</div></div>';
+      }).join('');
+    } else {
+      techPanel.innerHTML='<div style="grid-column:1/-1;text-align:center;color:var(--text2);font-size:11px;padding:10px">Sin posiciones abiertas</div>';
+    }
 
     // Live log
     try{
@@ -1107,29 +1158,107 @@ def get_ohlcv(exchange, symbol, timeframe="1h", limit=150):
 
 def calculate_indicators(df):
     df = df.copy()
+
+    # ── EMAs ──────────────────────────────────────────────────────────────────
     df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    # ── RSI ───────────────────────────────────────────────────────────────────
     delta = df["close"].diff()
     gain  = delta.clip(lower=0); loss = -delta.clip(upper=0)
     df["rsi"] = 100 - (100 / (1 + gain.ewm(com=13, adjust=False).mean() /
                                loss.ewm(com=13, adjust=False).mean().replace(0, np.nan)))
+
+    # ── Stochastic RSI ────────────────────────────────────────────────────────
+    rsi_min = df["rsi"].rolling(14).min()
+    rsi_max = df["rsi"].rolling(14).max()
+    df["stoch_rsi"] = (df["rsi"] - rsi_min) / (rsi_max - rsi_min + 1e-9) * 100
+    df["stoch_rsi_k"] = df["stoch_rsi"].rolling(3).mean()
+    df["stoch_rsi_d"] = df["stoch_rsi_k"].rolling(3).mean()
+
+    # ── Williams %R ───────────────────────────────────────────────────────────
+    high14 = df["high"].rolling(14).max()
+    low14  = df["low"].rolling(14).min()
+    df["williams_r"] = (high14 - df["close"]) / (high14 - low14 + 1e-9) * -100
+
+    # ── MACD ──────────────────────────────────────────────────────────────────
     ema12 = df["close"].ewm(span=12, adjust=False).mean()
     ema26 = df["close"].ewm(span=26, adjust=False).mean()
     df["macd"]        = ema12 - ema26
     df["macd_signal"] = df["macd"].ewm(span=9, adjust=False).mean()
     df["macd_hist"]   = df["macd"] - df["macd_signal"]
+
+    # ── Volume ────────────────────────────────────────────────────────────────
     df["vol_ma20"]    = df["volume"].rolling(20).mean()
-    df["bb_mid"]      = df["close"].rolling(BB_PERIOD).mean()
-    bb_std = df["close"].rolling(BB_PERIOD).std()
-    df["bb_upper"]    = df["bb_mid"] + BB_STD * bb_std
-    df["bb_lower"]    = df["bb_mid"] - BB_STD * bb_std
-    df["bb_width"]    = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
-    # ATR para trailing dinámico por volatilidad
+
+    # ── VWAP (diario, reseteado cada 24 períodos aprox) ───────────────────────
+    df["vwap"] = (df["close"] * df["volume"]).rolling(24).sum() / df["volume"].rolling(24).sum()
+
+    # ── Bollinger Bands ───────────────────────────────────────────────────────
+    df["bb_mid"]   = df["close"].rolling(BB_PERIOD).mean()
+    bb_std         = df["close"].rolling(BB_PERIOD).std()
+    df["bb_upper"] = df["bb_mid"] + BB_STD * bb_std
+    df["bb_lower"] = df["bb_mid"] - BB_STD * bb_std
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+    df["bb_width_ma"] = df["bb_width"].rolling(20).mean()
+
+    # ── ATR ───────────────────────────────────────────────────────────────────
     high_low   = df["high"] - df["low"]
     high_close = (df["high"] - df["close"].shift()).abs()
     low_close  = (df["low"]  - df["close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
+
+    # ── Keltner Channels ─────────────────────────────────────────────────────
+    df["kc_mid"]   = df["close"].ewm(span=20, adjust=False).mean()
+    df["kc_upper"] = df["kc_mid"] + 1.5 * df["atr"]
+    df["kc_lower"] = df["kc_mid"] - 1.5 * df["atr"]
+
+    # ── Volatility Squeeze (BB dentro de KC) ──────────────────────────────────
+    df["squeeze"] = (df["bb_upper"] < df["kc_upper"]) & (df["bb_lower"] > df["kc_lower"])
+
+    # ── Supertrend ────────────────────────────────────────────────────────────
+    mult = 3.0
+    hl2  = (df["high"] + df["low"]) / 2
+    df["st_upper"] = hl2 + mult * df["atr"]
+    df["st_lower"] = hl2 - mult * df["atr"]
+    supertrend = pd.Series(index=df.index, dtype=float)
+    direction  = pd.Series(index=df.index, dtype=int)
+    for i in range(1, len(df)):
+        if df["close"].iloc[i] > df["st_upper"].iloc[i-1]:
+            direction.iloc[i] = 1   # bullish
+            supertrend.iloc[i] = df["st_lower"].iloc[i]
+        elif df["close"].iloc[i] < df["st_lower"].iloc[i-1]:
+            direction.iloc[i] = -1  # bearish
+            supertrend.iloc[i] = df["st_upper"].iloc[i]
+        else:
+            direction.iloc[i] = direction.iloc[i-1]
+            supertrend.iloc[i] = df["st_lower"].iloc[i] if direction.iloc[i] == 1 else df["st_upper"].iloc[i]
+    df["supertrend"]     = supertrend
+    df["supertrend_dir"] = direction
+
+    # ── CCI (Commodity Channel Index) ─────────────────────────────────────────
+    tp = (df["high"] + df["low"] + df["close"]) / 3
+    tp_ma  = tp.rolling(20).mean()
+    tp_mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    df["cci"] = (tp - tp_ma) / (0.015 * tp_mad + 1e-9)
+
+    # ── Support & Resistance (pivots locales 20 velas) ───────────────────────
+    df["pivot_high"] = df["high"].rolling(5, center=True).max() == df["high"]
+    df["pivot_low"]  = df["low"].rolling(5, center=True).min() == df["low"]
+    # Últimos niveles de soporte y resistencia
+    recent_highs = df[df["pivot_high"]]["high"].tail(3)
+    recent_lows  = df[df["pivot_low"]]["low"].tail(3)
+    df["resistance"] = recent_highs.mean() if len(recent_highs) else float("nan")
+    df["support"]    = recent_lows.mean()  if len(recent_lows)  else float("nan")
+
+    # ── Higher Highs / Lower Lows (últimas 10 velas) ─────────────────────────
+    highs10 = df["high"].tail(10)
+    lows10  = df["low"].tail(10)
+    df["higher_highs"] = highs10.iloc[-1] > highs10.iloc[0]
+    df["lower_lows"]   = lows10.iloc[-1]  < lows10.iloc[0]
+
     return df
 
 def technical_signal(df):
@@ -1152,6 +1281,167 @@ def volume_signal(df):
     last = df.iloc[-1]
     if pd.isna(last["vol_ma20"]): return 0
     return +1 if last["volume"] > last["vol_ma20"] * 1.2 else 0
+
+# ─────────────────────────────────────────
+# NUEVAS SEÑALES TÉCNICAS
+# ─────────────────────────────────────────
+
+def vwap_signal(df) -> int:
+    """VWAP: precio sobre VWAP = alcista, bajo = bajista."""
+    last = df.iloc[-1]
+    if pd.isna(last.get("vwap", float("nan"))): return 0
+    diff_pct = (float(last["close"]) - float(last["vwap"])) / float(last["vwap"])
+    if diff_pct > 0.005:   return +1   # 0.5% sobre VWAP
+    if diff_pct < -0.005:  return -1   # 0.5% bajo VWAP
+    return 0
+
+def supertrend_signal(df) -> int:
+    """Supertrend: +1 alcista, -1 bajista, 0 cambio de dirección reciente."""
+    if len(df) < 5: return 0
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    curr_dir = int(last.get("supertrend_dir", 0))
+    prev_dir = int(prev.get("supertrend_dir", 0))
+    if curr_dir == 1 and prev_dir == -1:
+        log.info("  🟢 Supertrend: cruce BULLISH")
+        return +1
+    if curr_dir == -1 and prev_dir == 1:
+        log.info("  🔴 Supertrend: cruce BEARISH")
+        return -1
+    if curr_dir == 1:   return +1
+    if curr_dir == -1:  return -1
+    return 0
+
+def stoch_rsi_signal(df) -> int:
+    """Stochastic RSI: sobrevendido (<20) = +1, sobrecomprado (>80) = -1."""
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    k = float(last.get("stoch_rsi_k", 50))
+    k_prev = float(prev.get("stoch_rsi_k", 50))
+    if k < 20 and k > k_prev:   return +1   # saliendo de sobrevendido
+    if k > 80 and k < k_prev:   return -1   # saliendo de sobrecomprado
+    return 0
+
+def williams_r_signal(df) -> int:
+    """Williams %R: sobrevendido (<-80) = +1, sobrecomprado (>-20) = -1."""
+    last = df.iloc[-1]
+    wr = float(last.get("williams_r", -50))
+    if wr < -80: return +1
+    if wr > -20: return -1
+    return 0
+
+def cci_signal(df) -> int:
+    """CCI: extremo bajo (<-100) = posible rebote +1, extremo alto (>100) = -1."""
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    cci = float(last.get("cci", 0))
+    cci_prev = float(prev.get("cci", 0))
+    if cci < -100 and cci > cci_prev: return +1   # rebotando desde sobrevendido
+    if cci > 100  and cci < cci_prev: return -1   # cayendo desde sobrecomprado
+    return 0
+
+def squeeze_signal(df) -> int:
+    """Volatility Squeeze: detecta explosión de precio inminente."""
+    if len(df) < 3: return 0
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    # Squeeze se rompe (estaba comprimido, ahora no) + dirección MACD
+    was_squeezed = bool(prev.get("squeeze", False))
+    is_squeezed  = bool(last.get("squeeze", False))
+    if was_squeezed and not is_squeezed:
+        # Squeeze release — dirección según MACD histogram
+        macd_hist = float(last.get("macd_hist", 0))
+        if macd_hist > 0:
+            log.info("  💥 Squeeze release BULLISH")
+            return +1
+        elif macd_hist < 0:
+            log.info("  💥 Squeeze release BEARISH")
+            return -1
+    return 0
+
+def support_resistance_signal(df, direction: str) -> int:
+    """
+    Soporte/Resistencia: solo entrar long cerca de soporte, short cerca de resistencia.
+    Retorna +1 si el precio está cerca del soporte (long OK),
+            -1 si está cerca de la resistencia (short OK),
+             0 si está en medio (neutral).
+    """
+    last = df.iloc[-1]
+    price = float(last["close"])
+    support    = float(last.get("support",    float("nan")))
+    resistance = float(last.get("resistance", float("nan")))
+    if pd.isna(support) or pd.isna(resistance): return 0
+    sr_range = resistance - support
+    if sr_range <= 0: return 0
+    pos = (price - support) / sr_range  # 0=soporte, 1=resistencia
+    if pos < 0.25:  return +1   # cerca del soporte → buen long
+    if pos > 0.75:  return -1   # cerca de resistencia → buen short
+    return 0
+
+def candle_pattern_signal(df) -> int:
+    """
+    Patrones de velas japonesas:
+    - Bullish Engulfing, Hammer, Pinbar bullish → +1
+    - Bearish Engulfing, Shooting Star, Pinbar bearish → -1
+    - Doji en tendencia → señal débil de reversión
+    """
+    if len(df) < 3: return 0
+    last = df.iloc[-1]; prev = df.iloc[-2]
+    o, h, l, c = float(last["open"]), float(last["high"]), float(last["low"]), float(last["close"])
+    po, ph, pl, pc = float(prev["open"]), float(prev["high"]), float(prev["low"]), float(prev["close"])
+    body      = abs(c - o)
+    prev_body = abs(pc - po)
+    candle_range = h - l
+    if candle_range == 0: return 0
+
+    # Bullish Engulfing: vela alcista que engulle vela bajista previa
+    if c > o and pc > po and c > po and o < pc and body > prev_body * 1.1:
+        log.info("  🕯️  Bullish Engulfing")
+        return +1
+
+    # Bearish Engulfing: vela bajista que engulle vela alcista previa
+    if c < o and pc < po and c < po and o > pc and body > prev_body * 1.1:
+        log.info("  🕯️  Bearish Engulfing")
+        return -1
+
+    # Hammer (martillo): mecha inferior larga, cuerpo pequeño arriba
+    lower_wick = min(o, c) - l
+    upper_wick = h - max(o, c)
+    if lower_wick > body * 2 and upper_wick < body * 0.5 and c > o:
+        log.info("  🕯️  Hammer (bullish)")
+        return +1
+
+    # Shooting Star: mecha superior larga, cuerpo pequeño abajo
+    if upper_wick > body * 2 and lower_wick < body * 0.5 and c < o:
+        log.info("  🕯️  Shooting Star (bearish)")
+        return -1
+
+    # Pinbar bullish: mecha inferior > 60% del rango total, precio cierra arriba
+    if lower_wick / candle_range > 0.6 and c > (h + l) / 2:
+        log.info("  🕯️  Pinbar bullish")
+        return +1
+
+    # Pinbar bearish: mecha superior > 60% del rango total
+    if upper_wick / candle_range > 0.6 and c < (h + l) / 2:
+        log.info("  🕯️  Pinbar bearish")
+        return -1
+
+    # Doji: cuerpo muy pequeño (indecisión)
+    if body / candle_range < 0.1:
+        # En tendencia bajista un doji es señal de posible reversión alcista
+        ema9 = float(last.get("ema9", c))
+        ema21 = float(last.get("ema21", c))
+        if ema9 < ema21:  return +1   # posible reversión alcista
+        if ema9 > ema21:  return -1   # posible reversión bajista
+    return 0
+
+def trend_structure_signal(df) -> int:
+    """
+    Higher Highs / Lower Lows — confirma estructura de tendencia.
+    HH = alcista, LL = bajista.
+    """
+    last = df.iloc[-1]
+    hh = bool(last.get("higher_highs", False))
+    ll = bool(last.get("lower_lows", False))
+    if hh and not ll: return +1
+    if ll and not hh: return -1
+    return 0
 
 def rsi_divergence_signal(df):
     if len(df) < 10: return 0, False
@@ -1753,15 +2043,31 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     ob_sig = order_book_signal(public_ex, symbol)
     rsi_sig, rsi_div = rsi_divergence_signal(df)
 
+    # ── Nuevas señales técnicas ────────────────────────────────────────────
+    direction_hint = "long" if (t_sig + m_sig + bb_sig) >= 0 else "short"
+    vwap_sig    = vwap_signal(df)
+    st_sig      = supertrend_signal(df)
+    stoch_sig   = stoch_rsi_signal(df)
+    willy_sig   = williams_r_signal(df)
+    cci_sig     = cci_signal(df)
+    squeeze_sig = squeeze_signal(df)
+    sr_sig      = support_resistance_signal(df, direction_hint)
+    candle_sig  = candle_pattern_signal(df)
+    trend_sig   = trend_structure_signal(df)
+
     signals = {
         "tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig,
         "news": n_sig, "funding": fr_sig, "bb": bb_sig, "ob": ob_sig,
         "rsi_div": rsi_sig, "rsi_div_val": rsi_div,
+        # nuevas señales
+        "vwap": vwap_sig, "supertrend": st_sig, "stoch_rsi": stoch_sig,
+        "williams_r": willy_sig, "cci": cci_sig, "squeeze": squeeze_sig,
+        "support_res": sr_sig, "candle": candle_sig, "trend_struct": trend_sig,
     }
 
     # Score ponderado por aprendizaje
     score_float, score_int = weighted_score(signals, regime)
-    log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} BB:{bb_sig:+d} OB:{ob_sig:+d} RSIDiv:{rsi_sig:+d} VOL:{v_sig:+d} FR:{fr_sig:+d} NEWS:{n_sig:+d} = {score_float:+.1f} (raw int={score_int:+d})")
+    log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} BB:{bb_sig:+d} OB:{ob_sig:+d} RSIDiv:{rsi_sig:+d} VOL:{v_sig:+d} FR:{fr_sig:+d} NEWS:{n_sig:+d} VWAP:{vwap_sig:+d} ST:{st_sig:+d} STOCH:{stoch_sig:+d} WILLY:{willy_sig:+d} CCI:{cci_sig:+d} SQZ:{squeeze_sig:+d} SR:{sr_sig:+d} CANDLE:{candle_sig:+d} TREND:{trend_sig:+d} = {score_float:+.1f} (raw int={score_int:+d})")
 
     # Score mínimo dinámico (régimen + RL)
     # Sideways: threshold float 2.5 — ADA +2.7 entra, DOGE +1.7 no entra
