@@ -1,5 +1,5 @@
 """
-CryptoBot v2 — Simple Families Edition
+CryptoBot v3 — Tiered Entries Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Arquitectura limpia de 3 familias + filtro de contexto.
 
@@ -78,6 +78,10 @@ VWAP_PERIODS         = 24
 
 # Liquidez mínima
 MIN_VOLUME_24H       = 20_000_000  # $20M
+MIN_VOLUME_24H_TIERB = 75_000_000  # majors o alts muy líquidas para 2/3
+VOL_MULT_SOFT        = 1.15
+BODY_ATR_MULT_SOFT   = 1.5
+CONFIRM_EMA_PERIOD   = 21
 
 # Timeframes
 TF_SETUP    = "1h"    # tendencia, momentum, volumen
@@ -356,11 +360,14 @@ def family_momentum(df) -> int:
         return -1
     return 0
 
-def family_volume(df, direction: int) -> int:
+
+def family_volume(df, direction: int, soft: bool = False) -> int:
     """
     Volumen: VWAP + conviction + body filter
-    Long:  close > VWAP AND vol > vol_ma20 * 1.3 AND body < ATR * 1.2
-    Short: close < VWAP AND vol > vol_ma20 * 1.3 AND body < ATR * 1.2
+    Tier A (strict):
+      vol > vol_ma20 * 1.3 AND body < ATR * 1.2
+    Tier B (soft):
+      vol > vol_ma20 * 1.15 AND body < ATR * 1.5
     """
     last = df.iloc[-1]
     close  = float(last["close"])
@@ -370,29 +377,90 @@ def family_volume(df, direction: int) -> int:
     body   = float(last["body"])
     atr    = float(last.get("atr", close * 0.01))
 
-    if pd.isna(vwap) or pd.isna(vol_ma) or vol_ma == 0: return 0
+    if pd.isna(vwap) or pd.isna(vol_ma) or vol_ma == 0:
+        return 0
 
-    vol_ok  = vol > vol_ma * VOL_MULT
-    body_ok = body < atr * BODY_ATR_MULT
+    vol_mult = VOL_MULT_SOFT if soft else VOL_MULT
+    body_mult = BODY_ATR_MULT_SOFT if soft else BODY_ATR_MULT
+    vol_ok  = vol > vol_ma * vol_mult
+    body_ok = body < atr * body_mult
 
     if not vol_ok:
         return 0
     if not body_ok:
-        log.info(f"  ⏭️  Volumen: body {body:.4f} > ATR*{BODY_ATR_MULT} {atr*BODY_ATR_MULT:.4f} — skip")
+        log.info(f"  ⏭️  Volumen: body {body:.4f} > ATR*{body_mult} {atr*body_mult:.4f} — skip")
         return 0
 
+    tier = "soft" if soft else "strict"
     if direction >= 0 and close > vwap:
-        log.info(f"  📊 Volumen: BULLISH (close {close:.4f} > VWAP {vwap:.4f}, vol {vol/vol_ma:.1f}x)")
+        log.info(f"  📊 Volumen: BULLISH/{tier} (close {close:.4f} > VWAP {vwap:.4f}, vol {vol/vol_ma:.2f}x)")
         return +1
     if direction <= 0 and close < vwap:
-        log.info(f"  📊 Volumen: BEARISH (close {close:.4f} < VWAP {vwap:.4f})")
+        log.info(f"  📊 Volumen: BEARISH/{tier} (close {close:.4f} < VWAP {vwap:.4f}, vol {vol/vol_ma:.2f}x)")
         return -1
     return 0
+
+def confirmation_signal(exchange, symbol: str, direction: int) -> bool:
+    """
+    Confirmación rápida en 15m para habilitar entradas Tier B (2/3).
+    Long:
+      close > EMA21, close > VWAP, macd_hist > 0 y creciendo
+    Short:
+      close < EMA21, close < VWAP, macd_hist < 0 y decreciendo
+    """
+    try:
+        df = calculate_indicators(get_ohlcv(exchange, symbol, TF_CONFIRM, limit=80))
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        close  = float(last["close"])
+        ema21  = float(last["ema21"])
+        vwap   = float(last.get("vwap", close))
+        hist   = float(last["macd_hist"])
+        hprev  = float(prev["macd_hist"])
+
+        if direction > 0:
+            ok = close > ema21 and close > vwap and hist > 0 and hist > hprev
+        else:
+            ok = close < ema21 and close < vwap and hist < 0 and hist < hprev
+
+        if ok:
+            log.info(f"  ✅ Confirmación {TF_CONFIRM}: {'LONG' if direction > 0 else 'SHORT'}")
+        else:
+            log.info(f"  ⏭️  Confirmación {TF_CONFIRM}: falló para {'LONG' if direction > 0 else 'SHORT'}")
+        return ok
+    except Exception as e:
+        log.warning(f"  Confirm {symbol} error: {e}")
+        return False
+
+def classify_context(ctx: dict, regime: str) -> str:
+    """
+    bull     = longs habilitados y BTC4h alcista, sin sideways
+    neutral  = longs habilitados pero contexto no expansivo
+    risk_off = longs bloqueados
+    """
+    if not ctx.get("long_ok", False):
+        return "risk_off"
+    if ctx.get("btc4h_bull", False) and regime == "bull":
+        return "bull"
+    return "neutral"
+
+def ticker_quality(exchange, symbol: str) -> dict:
+    try:
+        t = exchange.fetch_ticker(symbol)
+        qv = float(t.get("quoteVolume") or 0)
+        bid = float(t.get("bid") or 0)
+        ask = float(t.get("ask") or 0)
+        spread = ((ask - bid) / bid) if bid > 0 and ask > 0 else 0
+        return {"quote_volume": qv, "spread": spread}
+    except Exception:
+        return {"quote_volume": 0, "spread": 999}
 
 # ─────────────────────────────────────────
 # FILTRO DE CONTEXTO
 # ─────────────────────────────────────────
 _btc4h_cache = {"long": None, "short": None, "ts": 0}
+
 
 def context_filter(exchange, regime: str, fg_value: int) -> dict:
     """
@@ -400,12 +468,13 @@ def context_filter(exchange, regime: str, fg_value: int) -> dict:
       long_ok:  bool
       short_ok: bool
       sideways: bool
+      btc4h_bull: bool
+      market_state: bull | neutral | risk_off
     """
     global _btc4h_cache
     now = time.time()
     sideways = regime == "sideways"
 
-    # Cache BTC 4h por 15 min
     if now - _btc4h_cache["ts"] > 900:
         try:
             df4h = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "4h", limit=30))
@@ -422,7 +491,7 @@ def context_filter(exchange, regime: str, fg_value: int) -> dict:
         except Exception as e:
             log.warning(f"  BTC 4h context error: {e}")
 
-    long_ok  = (
+    long_ok = (
         _btc4h_cache.get("long", True) and
         regime != "crash" and
         fg_value > MIN_FG_LONG
@@ -432,14 +501,24 @@ def context_filter(exchange, regime: str, fg_value: int) -> dict:
         regime == "crash"
     )
 
+    ctx = {
+        "long_ok": long_ok,
+        "short_ok": short_ok,
+        "sideways": sideways,
+        "btc4h_bull": _btc4h_cache.get("long", True),
+    }
+    ctx["market_state"] = classify_context(ctx, regime)
+
     if not long_ok:
         reasons = []
         if not _btc4h_cache.get("long", True): reasons.append("BTC4h bajista")
         if regime == "crash": reasons.append("crash")
         if fg_value <= MIN_FG_LONG: reasons.append(f"F&G={fg_value}≤{MIN_FG_LONG}")
         log.info(f"  🚫 Contexto: LONG bloqueado ({', '.join(reasons)})")
+    else:
+        log.info(f"  🧭 Contexto v3: {ctx['market_state'].upper()}")
 
-    return {"long_ok": long_ok, "short_ok": short_ok, "sideways": sideways}
+    return ctx
 
 # ─────────────────────────────────────────
 # COOLDOWN TRACKER
@@ -465,22 +544,30 @@ def tick_cooldowns():
 # ─────────────────────────────────────────
 # SIZING
 # ─────────────────────────────────────────
-def get_position_size(capital: float, symbol: str, regime: str, score: int) -> float:
+
+def get_position_size(capital: float, symbol: str, regime: str, score: int, tier: str = "A", context_state: str = "neutral") -> float:
     """
-    Sizing por régimen y tipo de activo.
-    3/3 + bull/bear      → 2%
-    3/3 + sideways       → 1.5%
-    3/3 + major + bull   → 2.5%
-    altcoin + sideways   → reducir 25% adicional
+    Tier A:
+      3/3 + bull major -> 2.5%
+      3/3 resto        -> 2.0%
+      sideways         -> 1.5%
+    Tier B:
+      2/3 + confirm    -> 1.0%
+      sideways         -> 0.75%
     """
     is_major = symbol in MAJORS
 
-    if regime == "sideways":
-        pct = SIZE_SIDEWAYS
-    elif is_major and regime == "bull":
-        pct = SIZE_MAJOR_BULL
+    if tier == "B":
+        pct = 0.010
+        if regime == "sideways":
+            pct = 0.0075
     else:
-        pct = SIZE_BASE
+        if regime == "sideways":
+            pct = SIZE_SIDEWAYS
+        elif is_major and context_state == "bull":
+            pct = SIZE_MAJOR_BULL
+        else:
+            pct = SIZE_BASE
 
     if regime == "sideways" and not is_major:
         pct *= SIZE_ALT_SIDEWAYS_MULT
@@ -607,7 +694,7 @@ def update_trailing_stops(exchange, state):
                 emoji = "🟢" if pnl > 0 else "🔴"
                 log.info(f"  {emoji} CERRADO {symbol} @ {price} | PnL: {pnl:+.2f}% ({'+' if usd_pnl>=0 else ''}{usd_pnl}) | {exit_reason}")
                 send_telegram(
-                    f"{emoji} <b>v2 {symbol}</b> {exit_reason.upper()}\n"
+                    f"{emoji} <b>v3 {symbol}</b> {exit_reason.upper()}\n"
                     f"Entrada: {pos['entry_price']} → Salida: {price}\n"
                     f"PnL: {pnl:+.2f}% | ${usd_pnl:+.2f}\n"
                     f"Capital: ${state['capital']:.2f}"
@@ -629,10 +716,12 @@ def update_trailing_stops(exchange, state):
 # ─────────────────────────────────────────
 # MOTOR PRINCIPAL DE ANÁLISIS
 # ─────────────────────────────────────────
+
 def analyze_symbol(symbol, exchange, regime, fg_value, state, ctx) -> bool:
     """
-    Evalúa un símbolo con la lógica de 3 familias.
-    Retorna True si abrió posición.
+    v3:
+      Tier A = 3/3
+      Tier B = 2/3 + confirmación 15m + liquidez suficiente
     """
     positions = load_positions()
     if symbol in positions:
@@ -642,13 +731,19 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, ctx) -> bool:
         return False
 
     is_major = symbol in MAJORS
+    context_state = ctx.get("market_state", "neutral")
 
-    # Verificar contexto
     if not ctx["long_ok"] and not ctx["short_ok"]:
         return False
-
-    # Descartar shorts en altcoins
     if not is_major and not ctx["long_ok"]:
+        return False
+
+    quality = ticker_quality(exchange, symbol)
+    if quality["quote_volume"] < MIN_VOLUME_24H:
+        log.info(f"  ⏭️  Liquidez insuficiente ({quality['quote_volume']:.0f}) — skip")
+        return False
+    if quality["spread"] > 0.004:
+        log.info(f"  ⏭️  Spread alto ({quality['spread']*100:.2f}%) — skip")
         return False
 
     try:
@@ -657,72 +752,83 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, ctx) -> bool:
         log.warning(f"  OHLCV error {symbol}: {e}")
         return False
 
-    # Calcular las 3 familias en ambas direcciones
-    if ctx["long_ok"]:
-        t_sig  = family_trend(df)
-        m_sig  = family_momentum(df)
-        v_sig  = family_volume(df, direction=+1)
-        score_long  = sum(1 for s in [t_sig, m_sig, v_sig] if s == +1)
-    else:
-        score_long = 0
+    # Familias strict (Tier A)
+    t_sig = family_trend(df)
+    m_sig = family_momentum(df)
+    v_sig_long = family_volume(df, direction=+1, soft=False)
+    v_sig_short = family_volume(df, direction=-1, soft=False)
 
-    if ctx["short_ok"] and is_major:
-        t_sig_s  = family_trend(df)
-        m_sig_s  = family_momentum(df)
-        v_sig_s  = family_volume(df, direction=-1)
-        score_short = sum(1 for s in [t_sig_s, m_sig_s, v_sig_s] if s == -1)
-    else:
-        score_short = 0
+    score_long = sum(1 for s in [t_sig, m_sig, v_sig_long] if s == +1) if ctx["long_ok"] else 0
+    score_short = sum(1 for s in [t_sig, m_sig, v_sig_short] if s == -1) if (ctx["short_ok"] and is_major) else 0
 
-    log.info(f"  [{TF_SETUP}] Score LONG={score_long}/3 SHORT={score_short}/3")
+    # Tier B: volumen soft + confirmación
+    v_sig_long_soft = family_volume(df, direction=+1, soft=True)
+    v_sig_short_soft = family_volume(df, direction=-1, soft=True)
+    score_long_soft = sum(1 for s in [t_sig, m_sig, v_sig_long_soft] if s == +1) if ctx["long_ok"] else 0
+    score_short_soft = sum(1 for s in [t_sig, m_sig, v_sig_short_soft] if s == -1) if (ctx["short_ok"] and is_major) else 0
 
-    # Threshold: 3/3 siempre requerido
-    # Altcoin en sideways: igual 3/3 pero size reducido (ya en sizing)
+    log.info(f"  [{TF_SETUP}] TierA LONG={score_long}/3 SHORT={score_short}/3 | TierB LONG={score_long_soft}/3 SHORT={score_short_soft}/3")
+
     action = None
-    score  = 0
+    score = 0
+    tier = None
+
+    # Tier A first
     if score_long == 3 and ctx["long_ok"]:
-        action = "BUY"; score = score_long
+        action, score, tier = "BUY", 3, "A"
     elif score_short == 3 and ctx["short_ok"] and is_major:
-        action = "SELL"; score = score_short
+        action, score, tier = "SELL", 3, "A"
+
+    # Tier B fallback: 2/3 + confirmación
+    if not action:
+        if ctx["long_ok"] and score_long_soft >= 2:
+            allow_tierb = is_major or (context_state == "bull" and quality["quote_volume"] >= MIN_VOLUME_24H_TIERB)
+            if allow_tierb and confirmation_signal(exchange, symbol, +1):
+                action, score, tier = "BUY", 2, "B"
+
+        if (not action) and ctx["short_ok"] and is_major and score_short_soft >= 2:
+            if confirmation_signal(exchange, symbol, -1):
+                action, score, tier = "SELL", 2, "B"
+
+    # Altcoins en sideways: bloquear Tier B
+    if action and (not is_major) and regime == "sideways" and tier == "B":
+        log.info("  ⏭️  Sideways + altcoin: Tier B bloqueado")
+        action = None
 
     if not action:
-        log.info(f"  ⏭️  Score insuficiente — skip")
+        log.info("  ⏭️  Score insuficiente / confirmación fallida — skip")
         return False
 
-    # Control de exposición
-    open_pos   = load_positions()
-    allocated  = sum(p.get("usd_size", 0) for p in open_pos.values())
-    capital    = state.get("capital", CAPITAL_TOTAL_USD)
+    open_pos = load_positions()
+    allocated = sum(p.get("usd_size", 0) for p in open_pos.values())
+    capital = state.get("capital", CAPITAL_TOTAL_USD)
     if allocated >= capital * MAX_CAPITAL_EXPOSURE:
         log.info(f"  ⏭️  Exposición máxima alcanzada (${allocated:.0f} / ${capital*MAX_CAPITAL_EXPOSURE:.0f})")
         return False
 
-    # Control de correlación altcoins
     open_alts = [s for s in open_pos if s not in MAJORS]
     if symbol not in MAJORS and len(open_alts) >= MAX_ALTS_OPEN:
         log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas — skip")
         return False
 
-    # Sizing
-    usd_size = get_position_size(capital, symbol, regime, score)
+    usd_size = get_position_size(capital, symbol, regime, score, tier=tier, context_state=context_state)
     if usd_size < 5:
         log.info(f"  ⏭️  Size demasiado pequeño (${usd_size})")
         return False
 
-    # Precio y ATR actuales
-    last  = df.iloc[-1]
+    last = df.iloc[-1]
     price = float(last["close"])
-    atr   = float(last["atr"]) if not pd.isna(last["atr"]) else None
+    atr = float(last["atr"]) if not pd.isna(last["atr"]) else None
 
-    log.info(f"  🟢 SEÑAL {action} {symbol} @ {price:.6f} | size=${usd_size} | score={score}/3 | régimen={regime}")
+    log.info(f"  🟢 SEÑAL {action} {symbol} @ {price:.6f} | size=${usd_size} | score={score}/3 | tier={tier} | ctx={context_state}")
 
     if PAPER_TRADING:
         open_position(symbol, price, usd_size, action, atr)
         send_telegram(
-            f"📝 <b>v2 PAPER {action} {symbol}</b>\n"
-            f"Score: {score}/3 | Régimen: {regime.upper()}\n"
+            f"📝 <b>v3 PAPER {action} {symbol}</b>\n"
+            f"Tier: {tier} | Score: {score}/3 | Régimen: {regime.upper()}\n"
             f"Precio: {price:.6f} | Size: ${usd_size}\n"
-            f"F&G: {fg_value} | BTC4h: {'↑' if ctx.get('long_ok') else '↓'}"
+            f"F&G: {fg_value} | Contexto: {context_state}"
         )
         return True
     return False
@@ -753,7 +859,7 @@ def scan_altcoins(exchange) -> list:
         pairs.sort()
         _altcoins = pairs[:15]
         _last_scan = now
-        log.info(f"🔍 v2 Altcoins: {_altcoins}")
+        log.info(f"🔍 v3 Altcoins: {_altcoins}")
     except Exception as e:
         log.error(f"Scanner error: {e}")
     return _altcoins
@@ -776,8 +882,8 @@ def check_daily_circuit(state) -> bool:
     if daily_loss > 0.03 and not state.get("daily_circuit"):
         state["daily_circuit"] = True
         save_state(state)
-        send_telegram(f"🛑 <b>v2 Circuit Breaker</b>\nPérdida diaria: {daily_loss*100:.1f}%\nSin entradas hasta mañana")
-        log.info(f"🛑 v2 Circuit breaker — pérdida diaria {daily_loss*100:.1f}%")
+        send_telegram(f"🛑 <b>v3 Circuit Breaker</b>\nPérdida diaria: {daily_loss*100:.1f}%\nSin entradas hasta mañana")
+        log.info(f"🛑 v3 Circuit breaker — pérdida diaria {daily_loss*100:.1f}%")
 
     return not state.get("daily_circuit", False)
 
@@ -789,7 +895,7 @@ DASHBOARD_V2 = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CryptoBot v2</title>
+<title>CryptoBot v3</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#04080f;--s1:#0b1220;--s2:#101828;--border:#162030;--green:#0dffb0;--red:#ff3366;--yellow:#ffd700;--blue:#38bdf8;--orange:#fb923c;--text:#a8bfd4;--text2:#6b8299;--white:#e2f0ff;--mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif}
@@ -846,14 +952,14 @@ footer{text-align:center;font-size:9px;color:var(--text2);margin-top:16px;paddin
 </head>
 <body>
 <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px">
-  <h1>Crypto<span>Bot</span> <small style="font-size:12px;color:var(--text2)">v2 Simple Families</small></h1>
+  <h1>Crypto<span>Bot</span> <small style="font-size:12px;color:var(--text2)">v3 Tiered Entries</small></h1>
   <div style="display:flex;gap:6px">
     <span class="pill g"><span class="dot"></span> LIVE</span>
     <span class="pill b" id="mode-pill">PAPER</span>
     <span style="font-size:10px;color:var(--text2);padding:2px 8px;background:var(--s1);border:1px solid var(--border);border-radius:3px">↻ <span id="cd">15</span>s</span>
   </div>
 </div>
-<div class="sub">3 familias · Sin dynamic weights · Sin RL · Contexto como filtro</div>
+<div class="sub">3 familias · Tier A/B · Confirmación 15m · Contexto como filtro</div>
 
 <div class="kpis">
   <div class="kpi" style="--k:var(--green)"><div class="kl">Capital</div><div class="kv g" id="k-cap">—</div><div class="ks" id="k-cap-d">—</div></div>
@@ -901,7 +1007,7 @@ footer{text-align:center;font-size:9px;color:var(--text2);margin-top:16px;paddin
   </div>
 </div>
 
-<footer>CryptoBot v2 · 3 Familias · Contexto filtro · Sin RL · Pesos fijos</footer>
+<footer>CryptoBot v3 · 3 Familias · Contexto filtro · Tier A/B · Confirmación 15m</footer>
 
 <script>
 let cd=15;
@@ -1014,11 +1120,11 @@ load();setInterval(tick,1000);
 # ─────────────────────────────────────────
 # FLASK API
 # ─────────────────────────────────────────
-flask_v2   = Flask("v2")
+flask_v3   = Flask("v2")
 _v2_regime = "unknown"
 _v2_fg     = {"value": 50, "label": "Neutral"}
 _v2_scanner = []
-_v2_ctx    = {"long_ok": True, "short_ok": False, "btc4h_bull": True}
+_v2_ctx    = {"long_ok": True, "short_ok": False, "btc4h_bull": True, "market_state": "neutral"}
 _v2_fam_stats = {"tendencia": {"wins":0,"total":0}, "momentum": {"wins":0,"total":0}, "volumen": {"wins":0,"total":0}}
 
 @flask_v2.route("/")
@@ -1046,11 +1152,11 @@ def v2_log_compat():
 
 @flask_v2.route("/health")
 def v2_health():
-    return jsonify({"status": "ok", "version": "v2", "paper": PAPER_TRADING})
+    return jsonify({"status": "ok", "version": "v3", "paper": PAPER_TRADING})
 
 def run_dashboard():
     port = int(os.environ.get("PORT", 8080))
-    log.info(f"🌐 v2 Dashboard en puerto {port}")
+    log.info(f"🌐 v3 Dashboard en puerto {port}")
     flask_v2.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ─────────────────────────────────────────
@@ -1059,13 +1165,13 @@ def run_dashboard():
 def run_bot():
     global _v2_regime, _v2_fg, _v2_scanner, _v2_ctx
 
-    log.info("🤖 CryptoBot v2 — Simple Families Edition")
+    log.info("🤖 CryptoBot v3 — Tiered Entries Edition")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     send_telegram(
-        f"🤖 <b>CryptoBot v2 — Simple Families</b>\n"
+        f"🤖 <b>CryptoBot v3 — Tiered Entries</b>\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
         f"3 familias: Tendencia + Momentum + Volumen\n"
-        f"Contexto como filtro | Sin RL | Pesos fijos\n"
+        f"Tier A/B | Confirmación 15m | Contexto como filtro\n"
         f"Shorts solo en majors | Cooldown {COOLDOWN_CANDLES} ciclos"
     )
 
@@ -1076,7 +1182,7 @@ def run_bot():
 
     while True:
         now = time.time()
-        log.info(f"\n{'='*50}\n⏰ v2 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log.info(f"\n{'='*50}\n⏰ v3 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
         state = load_state()
 
@@ -1093,7 +1199,7 @@ def run_bot():
 
         # Circuit breaker
         if not check_daily_circuit(state):
-            log.info("🛑 v2 Circuit breaker activo — skip entradas")
+            log.info("🛑 v3 Circuit breaker activo — skip entradas")
             update_trailing_stops(pub_exchange, state)
             tick_cooldowns()
             log.info(f"💤 {LOOP_INTERVAL_SEC}s...")
@@ -1109,7 +1215,7 @@ def run_bot():
         _v2_ctx = {**ctx, "btc4h_bull": _btc4h_cache.get("long", True)}
 
         open_positions = load_positions()
-        log.info(f"📂 v2 Posiciones: {list(open_positions.keys()) or 'ninguna'} | Capital: ${state.get('capital',CAPITAL_TOTAL_USD):.2f}")
+        log.info(f"📂 v3 Posiciones: {list(open_positions.keys()) or 'ninguna'} | Capital: ${state.get('capital',CAPITAL_TOTAL_USD):.2f}")
 
         # Analizar majors
         log.info(f"\n--- MAJORS [{TF_SETUP}] ---")
