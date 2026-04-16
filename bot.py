@@ -146,7 +146,8 @@ _weights_last_update = 0
 DEFAULT_WEIGHTS = {
     "tech": 1.0, "macd": 1.0, "bb": 1.0, "ob": 1.0,
     "rsi_div": 1.0, "vol": 0.8, "funding": 1.0,
-    "news": 0.7, "tf4h": 0.9,
+    "news": 0.5,   # bajado: RSS no es confiable para altcoins pequeñas
+    "tf4h": 0.6,   # bajado: 15m EMA estaba bajando el score de BIO innecesariamente
 }
 
 def recalculate_weights(regime):
@@ -933,7 +934,8 @@ def timeframe_confirm_signal(exchange, symbol, base_tf):
     confirm_tf = "15m" if base_tf == "3m" else ("30m" if base_tf == "1h" else "4h")
     try:
         df = calculate_indicators(get_ohlcv(exchange, symbol, timeframe=confirm_tf, limit=50))
-        return technical_signal(df)
+        # MACD más sensible que EMA cross en mercado lateral
+        return macd_signal(df)
     except Exception as e:
         log.warning(f"Confirm error {symbol}: {e}")
         return 0
@@ -954,7 +956,7 @@ def get_fear_greed():
         return 50, "Neutral"
 
 def fear_greed_filter(value, action, regime):
-    if action == "BUY"  and value < 15: return False
+    if action == "BUY"  and value < 12: return False   # bajado de 15 — más margen en Extreme Fear
     if action == "SELL" and value > 85: return False
     if regime == "crash" and action == "BUY": return False
     return True
