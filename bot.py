@@ -59,7 +59,7 @@ FUTURES_MIN_SCORE  = 4
 FUTURES_LEVERAGE   = 2
 MIN_SIGNALS        = 2
 MIN_SIGNALS_SIDEWAYS = 3
-CONFIDENCE_MIN     = 0.50
+CONFIDENCE_MIN     = 0.35  # bajado de 0.50 — Claude vetaba todo con RSI overbought en 3m
 LOOP_INTERVAL_SEC  = 60
 MAX_CAPITAL_EXPOSURE = 0.25  # 25% — con $500 permite posiciones más grandes
 MAX_WEEKLY_LOSS_PCT  = 0.10
@@ -1271,16 +1271,19 @@ def ask_claude(symbol, signals, df, fg_value, usd_size, pct, timeframe, regime, 
     rsi_div_info = "YES (strong signal)" if signals.get("rsi_div_val") else "No"
     weights = _weights_cache if _weights_cache else DEFAULT_WEIGHTS
 
-    prompt = f"""Trading crypto analyst. Respond ONLY in JSON, no backticks.
+    prompt = f"""Crypto trading signal validator. Respond ONLY in JSON, no backticks.
 
-Pair: {symbol} [{timeframe}] | Price: {last['close']:.4f} | Regime: {regime.upper()}
-EMA9/21: {last['ema9']:.4f}/{last['ema21']:.4f} | RSI: {last['rsi']:.1f}
-MACD hist: {last['macd_hist']:.4f} | BB: {last['bb_lower']:.4f}/{last['bb_upper']:.4f}
-Vol/MA20: {last['volume']:.0f}/{last['vol_ma20']:.0f} | Fear&Greed: {fg_value}
+IMPORTANT RULES:
+- The weighted score already filters RSI, EMA, MACD, volume, order book, funding rates and news
+- On {timeframe} timeframe, RSI 65-80 is NORMAL momentum, NOT a reason to HOLD
+- Only HOLD if: score < 2.0, OR clear contradicting signals (e.g. score positive but EMA and MACD both negative)
+- Trust the weighted score — it passed confirmation delay and multi-signal validation
+- SELL signals require futures mode only
 
-Raw signals: EMA:{signals.get('tech',0):+d} MACD:{signals.get('macd',0):+d} RSI_DIV:{rsi_div_info} BB:{signals.get('bb',0):+d} OB:{signals.get('ob',0):+d} VOL:{signals.get('vol',0):+d} FR:{signals.get('funding',0):+d} NEWS:{signals.get('news',0):+d}
-Weighted score: {score_float:.2f} | Learned weights: {json.dumps({k: round(v,1) for k,v in weights.items()})}
-Size: ${usd_size} ({pct*100:.0f}%) | StopLoss: {STOP_LOSS_PCT*100}% | PartialTP: {TAKE_PROFIT_PARTIAL*100}%
+Pair: {symbol} [{timeframe}] | Regime: {regime.upper()} | F&G: {fg_value}
+Weighted score: {score_float:+.2f} | RSI: {last['rsi']:.1f} (normal range for {timeframe})
+Signals: EMA:{signals.get('tech',0):+d} MACD:{signals.get('macd',0):+d} BB:{signals.get('bb',0):+d} OB:{signals.get('ob',0):+d} VOL:{signals.get('vol',0):+d} FR:{signals.get('funding',0):+d} NEWS:{signals.get('news',0):+d} RSI_DIV:{rsi_div_info}
+Size: ${usd_size} | SL: {STOP_LOSS_PCT*100}% | Partial TP: {TAKE_PROFIT_PARTIAL*100}%
 
 {{"action":"BUY"|"SELL"|"HOLD","confidence":0.0,"reasoning":"one concise line"}}"""
 
