@@ -1,5 +1,5 @@
 """
-CryptoBot v9 — Self-Learning Edition
+CryptoBot v10 — Aggressive Self-Learning Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 APRENDIZAJE AUTOMÁTICO:
 - Signal Memory: guarda qué señales llevaron a cada resultado
@@ -78,7 +78,14 @@ BB_STD    = 2.0
 REGIME_TREND_THRESHOLD = 0.02
 REGIME_CRASH_THRESHOLD = -0.05
 
-# v9 — Self-Learning
+# v10 — Aggressive Self-Learning
+SHORT_ENABLED          = True    # habilitar shorts en futuros
+SHORT_MIN_SCORE        = -2.5    # score ponderado mínimo para short
+SHORT_MAX_ALTS         = 2       # máx altcoins short simultáneas
+ATR_PERIOD             = 14      # período ATR para trailing dinámico
+ATR_MULTIPLIER_SPOT    = 1.5     # trailing = ATR * multiplier (spot)
+ATR_MULTIPLIER_FUT     = 1.0     # trailing = ATR * multiplier (futuros)
+SIDEWAYS_MIN_FLOAT     = 2.0     # bajado de 2.5 a 2.0 — más entradas
 SIGNAL_MEMORY_FILE   = "signal_memory.json"
 DYNAMIC_WEIGHTS_FILE = "dynamic_weights.json"
 WEIGHTS_UPDATE_INTERVAL = 3600   # recalcular pesos cada 1h
@@ -274,14 +281,21 @@ def check_entry_confirmation(symbol, signals_dict, df, timeframe):
         log.info(f"  ⏳ {symbol}: {elapsed:.0f}s / {wait_time}s — confirmando...")
         return False
 
-    # Ya pasó el tiempo — verificar que la señal sigue activa
-    current_t_sig = technical_signal(df)
-    prev_t_sig    = pending["signals"].get("tech", 0)
-
-    if current_t_sig == prev_t_sig and current_t_sig != 0:
-        log.info(f"  ✅ Confirmado {symbol} — señal persiste tras {elapsed:.0f}s")
+    # Ya pasó el tiempo — verificar que la señal general sigue siendo válida
+    # Comparamos dirección del score, no señal técnica exacta (más flexible)
+    prev_direction = 1 if sum(v for k,v in pending["signals"].items() if k != "rsi_div_val") > 0 else -1
+    cur_macd  = macd_signal(df)
+    cur_t_sig = technical_signal(df)
+    # Confirmar si al menos 1 señal principal persiste en la misma dirección
+    still_valid = (
+        (cur_macd == prev_direction) or
+        (cur_t_sig == prev_direction) or
+        (pending["signals"].get("ob", 0) == prev_direction and pending["signals"].get("funding", 0) == prev_direction)
+    )
+    if still_valid:
+        log.info(f"  ✅ Confirmado {symbol} — dirección persiste tras {elapsed:.0f}s")
         del _pending_entries[symbol]
-        return True  # entrar
+        return True
     else:
         log.info(f"  ❌ {symbol}: señal no confirmada — cancelando")
         del _pending_entries[symbol]
@@ -838,6 +852,12 @@ def calculate_indicators(df):
     df["bb_upper"]    = df["bb_mid"] + BB_STD * bb_std
     df["bb_lower"]    = df["bb_mid"] - BB_STD * bb_std
     df["bb_width"]    = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+    # ATR para trailing dinámico por volatilidad
+    high_low   = df["high"] - df["low"]
+    high_close = (df["high"] - df["close"].shift()).abs()
+    low_close  = (df["low"]  - df["close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["atr"] = tr.ewm(span=ATR_PERIOD, adjust=False).mean()
     return df
 
 def technical_signal(df):
@@ -1043,20 +1063,42 @@ def load_positions():
 def save_positions(positions):
     with open(POSITIONS_FILE, "w") as f: json.dump(positions, f, indent=2, default=str)
 
-def open_position(symbol, entry_price, usd_size, pct, action, timeframe, mode, signals_snap):
+def open_position(symbol, entry_price, usd_size, pct, action, timeframe, mode, signals_snap, atr_value=None):
     positions = load_positions()
-    trail_pct = FUTURES_TRAILING if "FUTURES" in mode else TRAILING_STOP_PCT
-    tp_pct    = FUTURES_TP       if "FUTURES" in mode else TAKE_PROFIT_PCT
+    is_futures = "FUTURES" in mode
+    is_short   = action == "SELL"
+
+    # ATR trailing dinámico — si no hay ATR, usar % fijo
+    if atr_value and atr_value > 0:
+        mult      = ATR_MULTIPLIER_FUT if is_futures else ATR_MULTIPLIER_SPOT
+        trail_abs = atr_value * mult
+        trail_pct_actual = trail_abs / entry_price
+        log.info(f"  📐 ATR trailing: {atr_value:.4f} × {mult} = {trail_abs:.4f} ({trail_pct_actual*100:.2f}%)")
+    else:
+        trail_pct_actual = FUTURES_TRAILING if is_futures else TRAILING_STOP_PCT
+
+    tp_pct = FUTURES_TP if is_futures else TAKE_PROFIT_PCT
+
+    # Para shorts: trail y TP van en dirección opuesta
+    if is_short:
+        trail_stop  = round(entry_price * (1 + trail_pct_actual), 4)  # sube si el precio sube
+        take_profit = round(entry_price * (1 - tp_pct), 4)            # TP debajo del precio
+        partial_tp  = round(entry_price * (1 - TAKE_PROFIT_PARTIAL), 4)
+        high_price  = entry_price  # para shorts, rastreamos el mínimo
+    else:
+        trail_stop  = round(entry_price * (1 - trail_pct_actual), 4)
+        take_profit = round(entry_price * (1 + tp_pct), 4)
+        partial_tp  = round(entry_price * (1 + TAKE_PROFIT_PARTIAL), 4)
+        high_price  = entry_price
+
     positions[symbol] = {
         "symbol": symbol, "action": action, "timeframe": timeframe, "mode": mode,
-        "entry_price": entry_price, "current_price": entry_price, "high_price": entry_price,
-        "trail_stop":  round(entry_price * (1 - trail_pct), 4),
-        "take_profit": round(entry_price * (1 + tp_pct), 4),
-        "partial_tp":  round(entry_price * (1 + TAKE_PROFIT_PARTIAL), 4),
-        "partial_closed": False,
+        "entry_price": entry_price, "current_price": entry_price, "high_price": high_price,
+        "trail_stop": trail_stop, "take_profit": take_profit, "partial_tp": partial_tp,
+        "partial_closed": False, "atr_value": round(atr_value, 6) if atr_value else None,
         "usd_size": usd_size, "risk_pct": pct,
         "opened_at": datetime.now().isoformat(),
-        "signals_snap": signals_snap,  # guardamos señales para aprender
+        "signals_snap": signals_snap,
     }
     save_positions(positions)
     log.info(f"  📂 Posición: {symbol} [{mode}] @ {entry_price} | Trail={positions[symbol]['trail_stop']} TP={positions[symbol]['take_profit']}")
@@ -1072,8 +1114,15 @@ def update_trailing_stops(public_ex, state):
             trail_pct = FUTURES_TRAILING if "FUTURES" in pos.get("mode","") else TRAILING_STOP_PCT
             tp_pct    = FUTURES_TP       if "FUTURES" in pos.get("mode","") else TAKE_PROFIT_PCT
 
-            if pos["action"] == "BUY":
-                # Trail dinámico
+            is_short = pos["action"] == "SELL"
+
+            # ATR trail dinámico — recalcular trail_pct si hay ATR guardado
+            atr_saved = pos.get("atr_value")
+            if atr_saved and atr_saved > 0 and current > 0:
+                mult = ATR_MULTIPLIER_FUT if "FUTURES" in pos.get("mode","") else ATR_MULTIPLIER_SPOT
+                trail_pct = (atr_saved * mult) / current
+
+            if not is_short:  # ── LONG ──
                 if current > pos["high_price"]:
                     pos["high_price"] = current
                     pos["trail_stop"] = round(current * (1 - trail_pct), 4)
@@ -1149,6 +1198,62 @@ def update_trailing_stops(public_ex, state):
                     save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
                         "action":"SELL","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":f"Take profit",
+                        "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
+                        "trail_triggered":False,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                    closed.append(symbol)
+
+            else:  # ── SHORT ──
+                # Para shorts, el trail_stop sube cuando el precio baja
+                if current < pos["high_price"]:
+                    pos["high_price"] = current   # rastreamos el mínimo
+                    pos["trail_stop"] = round(current * (1 + trail_pct), 4)
+                    log.info(f"  📉 Short Trail {symbol}: {pos['trail_stop']}")
+
+                # Stop loss short — si el precio SUBE más del 3%
+                stop_loss_price = pos["entry_price"] * (1 + STOP_LOSS_PCT)
+                if current >= stop_loss_price:
+                    pnl = (pos["entry_price"] - current) / pos["entry_price"] * 100
+                    log.info(f"  🛑 SHORT STOP LOSS {symbol} @ {current} | PnL: {pnl:.2f}%")
+                    pnl_usd = pnl * pos["usd_size"] / 100
+                    update_compounding(state, pnl_usd)
+                    if pos.get("signals_snap"):
+                        save_signal_to_memory(pos["signals_snap"], pnl, pos.get("regime","sideways"))
+                    send_telegram(f"🛑 <b>Short Stop Loss</b> — {symbol}\n{pnl:+.2f}% ❌")
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action":"BUY","price":current,"timeframe":pos.get("timeframe","1h"),
+                        "mode":pos.get("mode","SPOT"),"reasoning":"Short stop loss +3%",
+                        "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
+                        "stop_loss":True,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                    closed.append(symbol); continue
+
+                # Trail stop short — si el precio sube por encima del trail
+                if current >= pos["trail_stop"]:
+                    pnl = (pos["entry_price"] - current) / pos["entry_price"] * 100
+                    log.info(f"  🔴 SHORT TRAIL {symbol} @ {current} | PnL: {pnl:.2f}%")
+                    pnl_usd = pnl * pos["usd_size"] / 100
+                    update_compounding(state, pnl_usd)
+                    if pos.get("signals_snap"):
+                        save_signal_to_memory(pos["signals_snap"], pnl, pos.get("regime","sideways"))
+                    send_telegram(f"🔴 <b>Short Trail Stop</b> — {symbol}\n{pnl:+.2f}% {'✅' if pnl>0 else '❌'}")
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action":"BUY","price":current,"timeframe":pos.get("timeframe","1h"),
+                        "mode":pos.get("mode","SPOT"),"reasoning":"Short trail stop",
+                        "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
+                        "trail_triggered":True,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                    closed.append(symbol); continue
+
+                # Take profit short
+                if current <= pos["take_profit"]:
+                    pnl = (pos["entry_price"] - current) / pos["entry_price"] * 100
+                    log.info(f"  🎯 SHORT TP {symbol} @ {current} | PnL: +{pnl:.2f}%")
+                    pnl_usd = pnl * pos["usd_size"] / 100
+                    update_compounding(state, pnl_usd)
+                    if pos.get("signals_snap"):
+                        save_signal_to_memory(pos["signals_snap"], pnl, pos.get("regime","sideways"))
+                    send_telegram(f"🎯 <b>Short TP</b> — {symbol}\n+{pnl:.2f}% 🎉")
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action":"BUY","price":current,"timeframe":pos.get("timeframe","1h"),
+                        "mode":pos.get("mode","SPOT"),"reasoning":"Short take profit",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
                         "trail_triggered":False,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
                     closed.append(symbol)
@@ -1269,7 +1374,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     # Bull/Bear: threshold int 2 — más permisivo
     rl_min = rl_adjust_min_signals(state)
     if regime == "sideways":
-        min_float = 2.5
+        min_float = SIDEWAYS_MIN_FLOAT
         if abs(score_float) < min_float:
             log.info(f"  ⏭️  Score {score_float:+.1f} < {min_float} (sideways) — skip")
             return
@@ -1279,8 +1384,13 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
             log.info(f"  ⏭️  Score {score_int:+d} < {min_score} ({regime}) — skip")
             return
 
-    if timeframe == "3m" and score_int < 0:
-        log.info("  ⏭️  Bajista en 3m — skip")
+    # Shorts habilitados en futuros — solo bloquear si SHORT_ENABLED=False
+    if score_float < 0 and not SHORT_ENABLED:
+        log.info("  ⏭️  Bajista y shorts deshabilitados — skip")
+        return
+    # Para shorts en altcoins 3m, requerir score ≤ SHORT_MIN_SCORE
+    if timeframe == "3m" and score_float < 0 and score_float > SHORT_MIN_SCORE:
+        log.info(f"  ⏭️  Short score {score_float:+.1f} insuficiente (mínimo {SHORT_MIN_SCORE}) — skip")
         return
 
     # Correlación
@@ -1314,7 +1424,9 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     leverage    = FUTURES_LEVERAGE if use_futures else 1
 
     current_price = df.iloc[-1]["close"]
-    trail_stop    = round(current_price * (1 - trail_pct), 4)
+    atr_value     = df.iloc[-1].get("atr", None)
+    trail_pct_atr = (atr_value * (ATR_MULTIPLIER_FUT if use_futures else ATR_MULTIPLIER_SPOT) / current_price) if atr_value else None
+    trail_stop    = round(current_price * (1 - (trail_pct_atr or (FUTURES_TRAILING if use_futures else TRAILING_STOP_PCT))), 4)
     take_profit   = round(current_price * (1 + tp_pct), 4)
     partial_tp    = round(current_price * (1 + TAKE_PROFIT_PARTIAL), 4)
 
@@ -1339,8 +1451,8 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     if analysis["action"] == "BUY" and analysis["confidence"] >= CONFIDENCE_MIN:
         if PAPER_TRADING:
             save_trade({**base_record, "paper": True, "order_id": None})
-            open_position(symbol, current_price, usd_size, risk_pct, "BUY", timeframe, mode_label, signals_snap)
-            log.info(f"  📝 PAPER {mode_label} BUY @ {current_price} | Trail={trail_stop} TP={take_profit} PartialTP={partial_tp}")
+            open_position(symbol, current_price, usd_size, risk_pct, "BUY", timeframe, mode_label, signals_snap, atr_value)
+            log.info(f"  📝 PAPER {mode_label} BUY @ {current_price} | Trail={trail_stop} TP={take_profit} ATR={atr_value:.4f if atr_value else 'N/A'}")
             allocated_now = get_allocated_capital(open_positions)
             send_telegram(
                 f"📝 <b>PAPER {'🚀' if use_futures else '✅'} {mode_label} [{timeframe}]</b>\n"
@@ -1361,9 +1473,19 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
                 send_telegram(f"{'🚀' if use_futures else '✅'} <b>{mode_label}</b> — {symbol} @ {actual}\n💰 ${usd_size}×{leverage}")
 
     elif analysis["action"] == "SELL" and analysis["confidence"] >= CONFIDENCE_MIN:
+        if not use_futures:
+            log.info("  ⏭️  SELL requiere futuros — skip")
+            return
         if PAPER_TRADING:
             save_trade({**base_record, "paper": True, "order_id": None})
-            log.info(f"  📝 PAPER SELL @ {current_price}")
+            open_position(symbol, current_price, usd_size, risk_pct, "SELL", timeframe, mode_label, signals_snap, atr_value)
+            log.info(f"  📝 PAPER SHORT {mode_label} @ {current_price} | ATR={atr_value:.4f if atr_value else 'N/A'}")
+            send_telegram(
+                f"📉 <b>PAPER SHORT {mode_label} [{timeframe}]</b>\n"
+                f"<b>{symbol}</b> @ {current_price}\n"
+                f"Score: {score_float:+.1f} | Conf: {int(analysis['confidence']*100)}%\n"
+                f"🛑 SL: {round(current_price*(1+STOP_LOSS_PCT),4)} | 🎯 TP: {round(current_price*(1-FUTURES_TP),4)}"
+            )
         else:
             fn = execute_futures_trade if use_futures else execute_spot_trade
             order, _ = fn(futures_ex if use_futures else trade_ex, symbol, "SELL", usd_size)
