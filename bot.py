@@ -1496,7 +1496,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v9 — Self-Learning Edition")
+    log.info("🤖 CryptoBot v10 — Aggressive Self-Learning Edition")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
 
     send_telegram(
