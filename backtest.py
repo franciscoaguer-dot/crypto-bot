@@ -239,7 +239,7 @@ class Position:
 # ─────────────────────────────────────────────────────────────────────────────
 # MOTOR DE BACKTEST
 # ─────────────────────────────────────────────────────────────────────────────
-def run_backtest(symbol: str, df: pd.DataFrame, timeframe: str) -> dict:
+def run_backtest(symbol: str, df: pd.DataFrame, timeframe: str, score_threshold: float = 1.5) -> dict:
     df = calculate_indicators(df)
     df["bb_width_ma"] = df["bb_width"].rolling(20).mean()
 
@@ -251,7 +251,7 @@ def run_backtest(symbol: str, df: pd.DataFrame, timeframe: str) -> dict:
 
     # Ajustar threshold: sin OB/Funding/News el score máximo es ~5 vs 8 en live
     # Usamos threshold de 1.5 en vez de 2.0
-    SCORE_THRESHOLD = 1.5
+    SCORE_THRESHOLD = score_threshold
 
     for i in range(warmup, len(df)):
         row  = df.iloc[i]
