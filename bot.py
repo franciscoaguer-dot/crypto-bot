@@ -1267,23 +1267,26 @@ def update_trailing_stops(public_ex, state):
 # ─────────────────────────────────────────
 # CLAUDE — con rate limiter y retry
 # ─────────────────────────────────────────
-def ask_claude(symbol, signals, df, fg_value, usd_size, pct, timeframe, regime, score_float):
+def ask_claude(symbol, signals, df, fg_value, usd_size, pct, timeframe, regime, score_float, direction="LONG"):
     global _claude_last_call
     last  = df.iloc[-1]
     rsi_div_info = "YES (strong signal)" if signals.get("rsi_div_val") else "No"
     weights = _weights_cache if _weights_cache else DEFAULT_WEIGHTS
 
+    expected_action = "SELL" if direction == "SHORT" else "BUY"
+
     prompt = f"""Crypto trading signal validator. Respond ONLY in JSON, no backticks.
 
+DIRECTION: This is a {direction} signal — expected action is {expected_action}.
 IMPORTANT RULES:
 - The weighted score already filters RSI, EMA, MACD, volume, order book, funding rates and news
 - On {timeframe} timeframe, RSI 65-80 is NORMAL momentum, NOT a reason to HOLD
-- Only HOLD if: score < 2.0, OR clear contradicting signals (e.g. score positive but EMA and MACD both negative)
+- For SHORT: respond SELL if score supports it. For LONG: respond BUY if score supports it
+- Only HOLD if clear contradiction: score is {direction} but majority of signals point opposite direction
 - Trust the weighted score — it passed confirmation delay and multi-signal validation
-- SELL signals require futures mode only
 
 Pair: {symbol} [{timeframe}] | Regime: {regime.upper()} | F&G: {fg_value}
-Weighted score: {score_float:+.2f} | RSI: {last['rsi']:.1f} (normal range for {timeframe})
+Weighted score: {score_float:+.2f} | Direction: {direction}
 Signals: EMA:{signals.get('tech',0):+d} MACD:{signals.get('macd',0):+d} BB:{signals.get('bb',0):+d} OB:{signals.get('ob',0):+d} VOL:{signals.get('vol',0):+d} FR:{signals.get('funding',0):+d} NEWS:{signals.get('news',0):+d} RSI_DIV:{rsi_div_info}
 Size: ${usd_size} | SL: {STOP_LOSS_PCT*100}% | Partial TP: {TAKE_PROFIT_PARTIAL*100}%
 
@@ -1416,7 +1419,8 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     if not regime_filter(regime, "BUY" if score_int > 0 else "SELL"): return
 
     log.info("  🧠 Consultando Claude...")
-    analysis = ask_claude(symbol, signals, df, fg_value, usd_size, risk_pct, timeframe, regime, score_float)
+    direction = "SHORT" if score_float < 0 else "LONG"
+    analysis = ask_claude(symbol, signals, df, fg_value, usd_size, risk_pct, timeframe, regime, score_float, direction)
     log.info(f"  Claude: {analysis['action']} ({analysis['confidence']:.2f}) — {analysis['reasoning']}")
 
     if not fear_greed_filter(fg_value, analysis["action"], regime): return
