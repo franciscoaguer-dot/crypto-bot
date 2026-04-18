@@ -2044,16 +2044,26 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     rsi_sig, rsi_div = rsi_divergence_signal(df)
 
     # ── Nuevas señales técnicas ────────────────────────────────────────────
+    def _safe_sig(fn, *args):
+        """Wrapper seguro — NaN o errores retornan 0."""
+        try:
+            result = fn(*args)
+            if result is None or (isinstance(result, float) and (result != result)):
+                return 0
+            return int(result)
+        except Exception:
+            return 0
+
     direction_hint = "long" if (t_sig + m_sig + bb_sig) >= 0 else "short"
-    vwap_sig    = vwap_signal(df)
-    st_sig      = supertrend_signal(df)
-    stoch_sig   = stoch_rsi_signal(df)
-    willy_sig   = williams_r_signal(df)
-    cci_sig     = cci_signal(df)
-    squeeze_sig = squeeze_signal(df)
-    sr_sig      = support_resistance_signal(df, direction_hint)
-    candle_sig  = candle_pattern_signal(df)
-    trend_sig   = trend_structure_signal(df)
+    vwap_sig    = _safe_sig(vwap_signal, df)
+    st_sig      = _safe_sig(supertrend_signal, df)
+    stoch_sig   = _safe_sig(stoch_rsi_signal, df)
+    willy_sig   = _safe_sig(williams_r_signal, df)
+    cci_sig     = _safe_sig(cci_signal, df)
+    squeeze_sig = _safe_sig(squeeze_signal, df)
+    sr_sig      = _safe_sig(support_resistance_signal, df, direction_hint)
+    candle_sig  = _safe_sig(candle_pattern_signal, df)
+    trend_sig   = _safe_sig(trend_structure_signal, df)
 
     signals = {
         "tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig,
