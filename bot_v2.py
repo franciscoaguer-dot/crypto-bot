@@ -161,23 +161,53 @@ POSITIONS_FILE = f"{DATA_DIR}/v3_positions.json"
 STATE_FILE     = f"{DATA_DIR}/v3_state.json"
 TRADE_LOG_FILE = f"{DATA_DIR}/v3_trades.json"
 
-def _pg_get(key, default=None):
+def _pg_reconnect():
+    """Reconecta a Postgres si la conexión se perdió (deploy, timeout, etc.)"""
+    global _pg, _USE_PG
+    if not DATABASE_URL: return False
     try:
-        with _pg.cursor() as cur:
-            cur.execute("SELECT value FROM v3_kv WHERE key=%s", (key,))
-            row = cur.fetchone()
-            return json.loads(row[0]) if row else default
-    except: return default
+        import psycopg2
+        _pg = psycopg2.connect(DATABASE_URL, sslmode="require")
+        _pg.autocommit = True
+        _USE_PG = True
+        log.info("✅ Postgres reconectado")
+        return True
+    except Exception as e:
+        log.warning(f"PG reconnect failed: {e}")
+        _USE_PG = False
+        return False
+
+def _pg_get(key, default=None):
+    for attempt in range(2):
+        try:
+            with _pg.cursor() as cur:
+                cur.execute("SELECT value FROM v3_kv WHERE key=%s", (key,))
+                row = cur.fetchone()
+                return json.loads(row[0]) if row else default
+        except Exception as e:
+            if attempt == 0:
+                log.warning(f"PG get error, reconectando: {e}")
+                _pg_reconnect()
+            else:
+                log.error(f"PG get falló: {e}")
+    return default
 
 def _pg_set(key, value):
-    try:
-        with _pg.cursor() as cur:
-            cur.execute("""
-                INSERT INTO v3_kv (key, value, updated_at)
-                VALUES (%s, %s, NOW())
-                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
-            """, (key, json.dumps(value, default=str)))
-    except: pass
+    for attempt in range(2):
+        try:
+            with _pg.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO v3_kv (key, value, updated_at)
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()
+                """, (key, json.dumps(value, default=str)))
+            return
+        except Exception as e:
+            if attempt == 0:
+                log.warning(f"PG set error, reconectando: {e}")
+                _pg_reconnect()
+            else:
+                log.error(f"PG set falló: {e}")
 
 def load_state():
     d = {"capital": CAPITAL_TOTAL_USD, "day_start_capital": CAPITAL_TOTAL_USD,
@@ -210,12 +240,18 @@ def save_positions(p):
 
 def save_trade(r):
     if _USE_PG:
-        try:
-            with _pg.cursor() as cur:
-                cur.execute("INSERT INTO v3_trades (data) VALUES (%s)",
-                            (json.dumps(r, default=str),))
-            return
-        except: pass
+        for attempt in range(2):
+            try:
+                with _pg.cursor() as cur:
+                    cur.execute("INSERT INTO v3_trades (data) VALUES (%s)",
+                                (json.dumps(r, default=str),))
+                return
+            except Exception as e:
+                if attempt == 0:
+                    log.warning(f"PG save_trade error, reconectando: {e}")
+                    _pg_reconnect()
+                else:
+                    log.error(f"PG save_trade falló: {e}")
     data = []
     if os.path.exists(TRADE_LOG_FILE):
         try:
@@ -226,11 +262,17 @@ def save_trade(r):
 
 def load_trades():
     if _USE_PG:
-        try:
-            with _pg.cursor() as cur:
-                cur.execute("SELECT data FROM v3_trades ORDER BY created_at ASC")
-                return [row[0] for row in cur.fetchall()]
-        except: pass
+        for attempt in range(2):
+            try:
+                with _pg.cursor() as cur:
+                    cur.execute("SELECT data FROM v3_trades ORDER BY created_at ASC")
+                    return [row[0] for row in cur.fetchall()]
+            except Exception as e:
+                if attempt == 0:
+                    log.warning(f"PG load_trades error, reconectando: {e}")
+                    _pg_reconnect()
+                else:
+                    log.error(f"PG load_trades falló: {e}")
     if os.path.exists(TRADE_LOG_FILE):
         try:
             with open(TRADE_LOG_FILE) as f: return json.load(f)
