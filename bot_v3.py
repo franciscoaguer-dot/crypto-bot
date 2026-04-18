@@ -92,6 +92,8 @@ MAX_ALTS_OPEN     = 3
 
 # Risk management
 STOP_LOSS_PCT     = 0.025
+BINANCE_FEE_RT    = 0.001   # 0.1% entrada + 0.1% salida = 0.2% round-trip (spot)
+                             # Con BNB: 0.075% × 2 = 0.15% — conservador usar 0.2%
 TRAILING_PCT      = 0.012
 TP_PCT            = 0.030
 TP_PARTIAL_PCT    = 0.018
@@ -716,8 +718,10 @@ def update_trailing_stops(exchange, state):
                 pnl = ((price - pos["entry_price"]) / pos["entry_price"] * 100
                        if not is_short else
                        (pos["entry_price"] - price) / pos["entry_price"] * 100)
-                pnl     = round(pnl, 3)
-                usd_pnl = round(pnl * pos["usd_size"] / 100, 2)
+                # Descontar comisión Binance: 0.1% entrada + 0.1% salida = 0.2% round-trip
+                pnl_gross = pnl
+                pnl       = round(pnl - BINANCE_FEE_RT * 100, 3)
+                usd_pnl   = round(pnl * pos["usd_size"] / 100, 2)
                 state["capital"] = round(state.get("capital", CAPITAL_TOTAL_USD) + usd_pnl, 2)
                 save_state(state)
                 emoji = "🟢" if pnl > 0 else "🔴"
@@ -733,7 +737,7 @@ def update_trailing_stops(exchange, state):
                     "timestamp": datetime.now().isoformat(),
                     "symbol": symbol, "action": pos["action"],
                     "entry": pos["entry_price"], "exit": price,
-                    "pnl_pct": pnl, "usd_pnl": usd_pnl,
+                    "pnl_pct": pnl, "pnl_gross_pct": pnl_gross, "usd_pnl": usd_pnl,
                     "reason": exit_reason, "usd_size": pos["usd_size"],
                     "tier": pos.get("tier"), "context_entry": pos.get("context_entry"),
                     "partial": pos["partial_closed"],

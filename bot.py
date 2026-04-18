@@ -65,6 +65,7 @@ MAX_CAPITAL_EXPOSURE = 0.25  # 25% — con $500 permite posiciones más grandes
 MAX_WEEKLY_LOSS_PCT  = 0.10
 DRAWDOWN_REDUCE_PCT  = 0.50
 STOP_LOSS_PCT        = 0.03
+BINANCE_FEE_RT       = 0.001   # 0.1% entrada + 0.1% salida = 0.2% round-trip (spot)
 PROFIT_TRAIL_TRIGGER = 0.015
 PROFIT_TRAIL_STEP    = 0.010
 MAX_CORRELATION_ALTS = 3
@@ -178,6 +179,17 @@ def load_signal_memory():
             with open(SIGNAL_MEMORY_FILE) as f: return json.load(f)
         except: pass
     return {}
+
+
+def apply_fee(pnl_pct: float, mode: str = "SPOT") -> float:
+    """
+    Descuenta comisión Binance del PnL bruto.
+    SPOT:    0.1% × 2 = 0.2% round-trip
+    FUTURES: 0.04% × 2 = 0.08% (taker rate futuros)
+    Con BNB sería 25% menos, pero usamos el valor conservador sin BNB.
+    """
+    fee = 0.0004 if "FUT" in mode.upper() else BINANCE_FEE_RT
+    return round(pnl_pct - fee * 100, 3)
 
 def save_signal_to_memory(signals_dict, pnl_pct, regime):
     memory = load_signal_memory()
@@ -2021,7 +2033,7 @@ def update_trailing_stops(public_ex, state):
 
                 # SALIDA PARCIAL — cerrar 50% al primer TP parcial
                 if not pos.get("partial_closed") and current >= pos.get("partial_tp", float("inf")):
-                    partial_pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    partial_pnl = apply_fee((current - pos["entry_price"]) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     partial_usd = pos["usd_size"] * PARTIAL_EXIT_PCT
                     log.info(f"  ½ PARTIAL TP {symbol} @ {current} | PnL parcial: +{partial_pnl:.2f}%")
                     pos["partial_closed"] = True
@@ -2038,7 +2050,7 @@ def update_trailing_stops(public_ex, state):
                 # Stop loss absoluto
                 stop_loss_price = pos["entry_price"] * (1 - STOP_LOSS_PCT)
                 if current <= stop_loss_price and current < pos["entry_price"]:
-                    pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    pnl = apply_fee((current - pos["entry_price"]) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     log.info(f"  🛑 STOP LOSS {symbol} @ {current} | PnL: {pnl:.2f}%")
                     pnl_usd = pnl * pos["usd_size"] / 100
                     update_compounding(state, pnl_usd)
@@ -2063,7 +2075,7 @@ def update_trailing_stops(public_ex, state):
 
                 # Trail stop hit
                 if current <= pos["trail_stop"]:
-                    pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    pnl = apply_fee((current - pos["entry_price"]) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     log.info(f"  🔴 TRAIL STOP {symbol} @ {current} | PnL: {pnl:.2f}%")
                     pnl_usd = pnl * pos["usd_size"] / 100
                     update_compounding(state, pnl_usd)
@@ -2079,7 +2091,7 @@ def update_trailing_stops(public_ex, state):
 
                 # Take profit final
                 if current >= pos["take_profit"]:
-                    pnl = (current - pos["entry_price"]) / pos["entry_price"] * 100
+                    pnl = apply_fee((current - pos["entry_price"]) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     log.info(f"  🎯 TAKE PROFIT {symbol} @ {current} | PnL: +{pnl:.2f}%")
                     pnl_usd = pnl * pos["usd_size"] / 100
                     update_compounding(state, pnl_usd)
@@ -2103,7 +2115,7 @@ def update_trailing_stops(public_ex, state):
                 # Stop loss short — si el precio SUBE más del 3%
                 stop_loss_price = pos["entry_price"] * (1 + STOP_LOSS_PCT)
                 if current >= stop_loss_price:
-                    pnl = (pos["entry_price"] - current) / pos["entry_price"] * 100
+                    pnl = apply_fee((pos["entry_price"] - current) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     log.info(f"  🛑 SHORT STOP LOSS {symbol} @ {current} | PnL: {pnl:.2f}%")
                     pnl_usd = pnl * pos["usd_size"] / 100
                     update_compounding(state, pnl_usd)
@@ -2119,7 +2131,7 @@ def update_trailing_stops(public_ex, state):
 
                 # Trail stop short — si el precio sube por encima del trail
                 if current >= pos["trail_stop"]:
-                    pnl = (pos["entry_price"] - current) / pos["entry_price"] * 100
+                    pnl = apply_fee((pos["entry_price"] - current) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     log.info(f"  🔴 SHORT TRAIL {symbol} @ {current} | PnL: {pnl:.2f}%")
                     pnl_usd = pnl * pos["usd_size"] / 100
                     update_compounding(state, pnl_usd)
@@ -2135,7 +2147,7 @@ def update_trailing_stops(public_ex, state):
 
                 # Take profit short
                 if current <= pos["take_profit"]:
-                    pnl = (pos["entry_price"] - current) / pos["entry_price"] * 100
+                    pnl = apply_fee((pos["entry_price"] - current) / pos["entry_price"] * 100, pos.get("mode","SPOT"))
                     log.info(f"  🎯 SHORT TP {symbol} @ {current} | PnL: +{pnl:.2f}%")
                     pnl_usd = pnl * pos["usd_size"] / 100
                     update_compounding(state, pnl_usd)
