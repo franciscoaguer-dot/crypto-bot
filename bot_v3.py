@@ -562,8 +562,12 @@ def evaluate_entry(symbol, score_long, score_short, families_long, families_shor
             return "BUY", Tier.A, "score=3/3 Tier A"
 
         if score_long == 2 and context == Context.BULL:
-            # Tier B: en BULL siempre se intenta (incluye BULL_CAUTIOUS)
-            # Confirmación 15m requerida — si falla, logueamos y saltamos
+            # FIX 1: Tier B bloqueado en sideways — demasiado ruido, WR 31% histórico
+            # Solo opera en bull o bear con momentum claro
+            if regime == "sideways":
+                return None, Tier.NONE, "score=2/3 Tier B bloqueado en sideways (bajo WR histórico)"
+
+            # Tier B: en BULL no-sideways + confirmación 15m
             if confirm_15m(exchange, symbol, +1):
                 cautious_note = " [F&G bajo → size reducido]" if _btc4h_cache.get("cautious") else ""
                 return "BUY", Tier.B, f"score=2/3 Tier B + 15m confirmado{cautious_note}"
@@ -637,12 +641,16 @@ def tick_cooldowns():
 # ─────────────────────────────────────────
 # GESTIÓN DE POSICIONES
 # ─────────────────────────────────────────
-def open_position(symbol, entry_price, usd_size, action, atr_value, tier, context):
+def open_position(symbol, entry_price, usd_size, action, atr_value, tier, context, regime="bull"):
     positions = load_positions()
     is_short  = action == "SELL"
-    trail_pct = max((atr_value * ATR_MULT / entry_price) if atr_value else TRAILING_PCT,
-                     TRAILING_PCT)
-    trail_pct = min(trail_pct, 0.03)
+
+    # FIX 2: Trail más amplio en sideways para evitar stops prematuros
+    # Backtest mostró 175 trades cerrados innecesariamente por trail < 1.5% loss
+    base_trail = 0.020 if regime == "sideways" else TRAILING_PCT  # 2% en sideways, 1.2% en tendencia
+    trail_pct  = max((atr_value * ATR_MULT / entry_price) if atr_value else base_trail,
+                      base_trail)
+    trail_pct  = min(trail_pct, 0.04)  # máximo 4% (antes 3%)
 
     if is_short:
         trail_stop  = round(entry_price * (1 + trail_pct), 8)
@@ -855,7 +863,7 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
              f"| Tier {tier.value} | size=${usd_size} | ctx={context.value}")
 
     if PAPER_TRADING:
-        open_position(symbol, price, usd_size, action, atr, tier, context)
+        open_position(symbol, price, usd_size, action, atr, tier, context, _v3_regime)
         send_telegram(
             f"📝 <b>v3 PAPER {action} {symbol}</b> [Tier {tier.value}]\n"
             f"Score: {score}/3 | Contexto: {context.value.upper()}\n"
@@ -903,13 +911,32 @@ def scan_altcoins(exchange) -> list:
 # RÉGIMEN Y F&G
 # ─────────────────────────────────────────
 def detect_regime(exchange) -> str:
+    """
+    FIX 3: Detector de régimen mejorado.
+    Usa 14 días + múltiples timeframes para ser más preciso.
+    - 14d en vez de 7d → menos sensible al ruido
+    - Confirma con 3d para tendencias de corto plazo
+    - Requiere que ambos períodos coincidan para declarar bull/bear
+    """
     try:
-        df = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "1d", limit=7))
-        pct = (df.iloc[-1]["close"] - df.iloc[-7]["close"]) / df.iloc[-7]["close"]
-        atr_pct = df.iloc[-1]["atr"] / df.iloc[-1]["close"]
-        if pct < -0.08 and atr_pct > 0.04: return "crash"
-        if pct < -0.03: return "bear"
-        if pct > 0.03:  return "bull"
+        df = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "1d", limit=20))
+        close  = df.iloc[-1]["close"]
+        d14    = df.iloc[-14]["close"]
+        d3     = df.iloc[-3]["close"]
+        pct14  = (close - d14) / d14      # cambio 14 días
+        pct3   = (close - d3)  / d3       # cambio 3 días (momentum reciente)
+        atr_pct= df.iloc[-1]["atr"] / close
+
+        # Crash: caída fuerte y volátil
+        if pct14 < -0.10 and atr_pct > 0.04: return "crash"
+
+        # Bull: subida 14d Y momentum positivo 3d
+        if pct14 > 0.05 and pct3 > 0.0:    return "bull"
+
+        # Bear: bajada 14d Y momentum negativo 3d
+        if pct14 < -0.05 and pct3 < 0.0:   return "bear"
+
+        # Sideways: todo lo demás (incluye movimientos mixtos)
         return "sideways"
     except: return "sideways"
 
