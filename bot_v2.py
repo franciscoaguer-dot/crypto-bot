@@ -446,18 +446,25 @@ def get_market_context(exchange, regime: str, fg_value: int) -> Context:
     btc_bull = _btc4h_cache.get("bull", True)
     is_crash = regime == "crash"
 
-    # RISK_OFF: cualquier condición negativa
-    if not btc_bull or is_crash or fg_value < FG_RISK_OFF_MAX:
+    # RISK_OFF: BTC bajista O crash — F&G ya no lo baja a RISK_OFF
+    if not btc_bull or is_crash:
         ctx = Context.RISK_OFF
-    # BULL: todas las condiciones positivas
-    elif btc_bull and fg_value > FG_BULL_MIN and not is_crash:
+    # BULL: BTC alcista + régimen no crash
+    # F&G bajo (< FG_BULL_MIN) → sigue siendo BULL pero con subtype CAUTIOUS
+    # El sizing se ajusta en get_size(), no acá
+    elif btc_bull and regime in ("bull", "sideways", "bear"):
         ctx = Context.BULL
-    # NEUTRAL: todo lo demás
     else:
         ctx = Context.NEUTRAL
 
-    log.info(f"  📊 Contexto: {ctx.value.upper()} "
+    # Subtype para logging y sizing
+    cautious = fg_value < FG_BULL_MIN and ctx == Context.BULL
+    subtype  = " CAUTIOUS" if cautious else ""
+    log.info(f"  📊 Contexto: {ctx.value.upper()}{subtype} "
              f"(BTC4h={'↑' if btc_bull else '↓'} | F&G={fg_value} | régimen={regime})")
+
+    # Guardar subtype en cache para que get_size lo use
+    _btc4h_cache["cautious"] = cautious
     return ctx
 
 # ─────────────────────────────────────────
@@ -483,14 +490,16 @@ def evaluate_entry(symbol, score_long, score_short, families_long, families_shor
             return "BUY", Tier.A, "score=3/3 Tier A"
 
         if score_long == 2 and context == Context.BULL:
-            # Tier B: necesita confirmación 15m
+            # Tier B: en BULL siempre se intenta (incluye BULL_CAUTIOUS)
+            # Confirmación 15m requerida — si falla, logueamos y saltamos
             if confirm_15m(exchange, symbol, +1):
-                return "BUY", Tier.B, "score=2/3 Tier B + 15m confirmado"
+                cautious_note = " [F&G bajo → size reducido]" if _btc4h_cache.get("cautious") else ""
+                return "BUY", Tier.B, f"score=2/3 Tier B + 15m confirmado{cautious_note}"
             else:
                 return None, Tier.NONE, "score=2/3 Tier B pero 15m no confirma"
 
         if score_long == 2 and context == Context.NEUTRAL:
-            return None, Tier.NONE, "score=2/3 en NEUTRAL → threshold insuficiente"
+            return None, Tier.NONE, "score=2/3 en NEUTRAL → no entra (solo BULL)"
 
     # ── SHORTS (solo majors) ──────────────────────────────────────────────────
     if is_major and context in [Context.RISK_OFF, Context.NEUTRAL]:
@@ -517,6 +526,11 @@ def get_size(capital: float, symbol: str, tier: Tier,
     # Reducción en sideways
     if sideways:
         pct *= SIZE_SIDEWAYS_MULT
+
+    # Reducción cuando F&G bajo (BULL_CAUTIOUS) — mercado con miedo
+    if _btc4h_cache.get("cautious"):
+        pct *= 0.75
+        log.info(f"  ⚠️  BULL_CAUTIOUS (F&G bajo) → size reducido 25%")
 
     # Reducción en euforia (F&G > 75)
     if fg_value > FG_GREED_MAX:
@@ -744,9 +758,12 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
         return False
 
     # Control correlación altcoins
+    # Tier A (3/3): ignora límite — setup fuerte, vale la pena
+    # Tier B (2/3): límite aumentado a 5 altcoins abiertas
     open_alts = [s for s in open_pos if s not in MAJORS]
-    if not is_major and len(open_alts) >= MAX_ALTS_OPEN:
-        log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas")
+    alt_limit = 999 if tier == Tier.A else 5
+    if not is_major and len(open_alts) >= alt_limit:
+        log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas (límite Tier B={alt_limit})")
         return False
 
     # Sizing
