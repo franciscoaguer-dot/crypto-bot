@@ -912,31 +912,25 @@ def scan_altcoins(exchange) -> list:
 # ─────────────────────────────────────────
 def detect_regime(exchange) -> str:
     """
-    FIX 3: Detector de régimen mejorado.
-    Usa 14 días + múltiples timeframes para ser más preciso.
-    - 14d en vez de 7d → menos sensible al ruido
-    - Confirma con 3d para tendencias de corto plazo
-    - Requiere que ambos períodos coincidan para declarar bull/bear
+    Detector de régimen v4 — 3 timeframes: 30d, 14d, 3d.
+    Calibrado con datos reales 2025 para reducir falsos sideways.
     """
     try:
-        df = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "1d", limit=20))
-        close  = df.iloc[-1]["close"]
-        d14    = df.iloc[-14]["close"]
-        d3     = df.iloc[-3]["close"]
-        pct14  = (close - d14) / d14      # cambio 14 días
-        pct3   = (close - d3)  / d3       # cambio 3 días (momentum reciente)
-        atr_pct= df.iloc[-1]["atr"] / close
+        df    = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "1d", limit=35))
+        close = float(df.iloc[-1]["close"])
+        d30   = float(df.iloc[-30]["close"])
+        d14   = float(df.iloc[-14]["close"])
+        d3    = float(df.iloc[-3]["close"])
+        pct30 = (close - d30) / d30
+        pct14 = (close - d14) / d14
+        pct3  = (close - d3)  / d3
+        atr   = float(df["close"].rolling(14).std().iloc[-1])
+        atr_pct = atr / close
 
-        # Crash: caída fuerte y volátil
-        if pct14 < -0.10 and atr_pct > 0.04: return "crash"
-
-        # Bull: subida 14d Y momentum positivo 3d
-        if pct14 > 0.05 and pct3 > 0.0:    return "bull"
-
-        # Bear: bajada 14d Y momentum negativo 3d
-        if pct14 < -0.05 and pct3 < 0.0:   return "bear"
-
-        # Sideways: todo lo demás (incluye movimientos mixtos)
+        if pct14 < -0.12 and atr_pct > 0.035: return "crash"
+        if pct30 < -0.08 and pct14 < -0.04 and pct3 < 0: return "bear"
+        if pct30 > 0.05  and pct14 > 0.02  and pct3 > -0.01: return "bull"
+        if pct14 > 0.06  and pct3 > 0.005: return "bull"
         return "sideways"
     except: return "sideways"
 
