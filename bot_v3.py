@@ -88,7 +88,7 @@ SIZE_DEFAULT      = 0.015
 SIZE_SIDEWAYS_MULT= 0.75
 MAX_SIZE_PCT      = 0.025   # nunca más de 2.5%
 MAX_EXPOSURE      = 0.20    # máx 20% capital total
-MAX_ALTS_OPEN     = 3
+MAX_ALTS_OPEN     = 5
 
 # Risk management
 STOP_LOSS_PCT     = 0.025
@@ -112,7 +112,7 @@ FG_RISK_OFF_MAX   = 20
 FG_GREED_MAX      = 75      # euforia → reducir size
 
 # Liquidez
-MIN_VOL_24H       = 20_000_000
+MIN_VOL_24H       = 10_000_000  # bajado de 20M → más pares califican
 
 # Timeframes
 TF_SETUP    = "1h"
@@ -892,7 +892,7 @@ def scan_altcoins(exchange) -> list:
             if (t.get("quoteVolume") or 0) < MIN_VOL_24H: continue
             pairs.append(sym)
         pairs.sort()
-        _altcoins  = pairs[:15]
+        _altcoins  = pairs[:25]
         _last_scan = now
         log.info(f"🔍 v3 Altcoins: {_altcoins}")
     except Exception as e:

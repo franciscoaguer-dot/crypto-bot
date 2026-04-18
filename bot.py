@@ -68,7 +68,7 @@ STOP_LOSS_PCT        = 0.03
 BINANCE_FEE_RT       = 0.001   # 0.1% entrada + 0.1% salida = 0.2% round-trip (spot)
 PROFIT_TRAIL_TRIGGER = 0.015
 PROFIT_TRAIL_STEP    = 0.010
-MAX_CORRELATION_ALTS = 3
+MAX_CORRELATION_ALTS = 5
 CLAUDE_RATE_LIMIT_SEC = 2
 CLAUDE_MAX_RETRIES   = 3
 FUNDING_BULLISH_THRESHOLD = -0.0001
@@ -81,7 +81,7 @@ REGIME_CRASH_THRESHOLD = -0.05
 
 # v10 — Aggressive Self-Learning
 SHORT_ENABLED          = True    # habilitar shorts en futuros
-SHORT_MIN_SCORE        = -2.5    # score ponderado mínimo para short
+SHORT_MIN_SCORE        = -2.0    # score ponderado mínimo para short (relajado)
 SHORT_MAX_ALTS         = 2       # máx altcoins short simultáneas
 ATR_PERIOD             = 14      # período ATR para trailing dinámico
 ATR_MULTIPLIER_SPOT    = 1.5     # trailing = ATR * multiplier (spot)
@@ -2677,7 +2677,7 @@ def run_bot():
         # Scan altcoins cada 10 min
         if now - last_scan > 600:
             log.info("🔍 Escaneando altcoins...")
-            altcoins  = scan_top_altcoins(public_ex, max_alts=15)
+            altcoins  = scan_top_altcoins(public_ex, max_alts=25)
             last_scan = now
 
         open_positions = load_positions()
