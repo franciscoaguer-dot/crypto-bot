@@ -204,20 +204,30 @@ _weights_cache = {}
 _weights_last_update = 0
 
 DEFAULT_WEIGHTS = {
-    # señales originales
-    "tech": 1.0, "macd": 1.0, "bb": 1.0, "ob": 1.0,
-    "rsi_div": 1.0, "vol": 0.8, "funding": 1.0,
-    "news": 0.5, "tf4h": 0.6,
-    # nuevas señales técnicas
-    "vwap": 1.2,        # VWAP — muy respetado por institucionales
-    "supertrend": 1.3,  # Supertrend — excelente filtro de tendencia
-    "stoch_rsi": 0.8,   # Stochastic RSI — momentum oscilador
-    "williams_r": 0.7,  # Williams %R — sobrecompra/sobreventa
-    "cci": 0.7,         # CCI — commodity channel index
-    "squeeze": 1.2,     # Squeeze release — explosión de precio inminente
-    "support_res": 1.0, # Soporte/Resistencia — niveles clave
-    "candle": 1.1,      # Patrones de velas — confirmación visual
-    "trend_struct": 0.9, # HH/LL — estructura de tendencia
+    # ── SCORE PRINCIPAL: 3 grupos, máx ~6 pts ──────────────────────
+    # Trend group
+    "tech":         1.0,  # EMA cross
+    "supertrend":   1.3,  # Supertrend
+    # Momentum group
+    "macd":         1.0,  # MACD histogram
+    "rsi_div":      1.0,  # RSI divergence
+    # Confirmation group
+    "vwap":         1.2,  # VWAP
+    "vol":          0.8,  # Volume
+    "trend_struct": 0.9,  # HH/LL structure
+    # ── FILTROS CONTEXTUALES: no suman al score ─────────────────────
+    # Estas señales se calculan pero se usan como filtros/ajuste de size
+    "tf4h":        0.0,   # 4h confirmation → filtro separado
+    "bb":          0.0,   # Bollinger → filtro pump/dump
+    "ob":          0.0,   # Order book → ajuste de size
+    "news":        0.0,   # News → filtro contextual
+    "funding":     0.0,   # Funding → ajuste de size
+    "stoch_rsi":   0.0,   # Stoch RSI → filtro sobreextensión
+    "williams_r":  0.0,   # Williams → filtro sobrecompra
+    "cci":         0.0,   # CCI → filtro secundario
+    "squeeze":     0.0,   # Squeeze → confirmación opcional
+    "support_res": 0.0,   # S/R → filtro niveles
+    "candle":      0.0,   # Candlestick → filtro confirmación
 }
 
 def recalculate_weights(regime):
@@ -2315,23 +2325,27 @@ def pump_dump_filter(df: pd.DataFrame, symbol: str, fr_val: float) -> bool:
     return True
 
 
-def volume_conviction_filter(df: pd.DataFrame, regime: str = "sideways") -> bool:
+def volume_conviction_filter(df: pd.DataFrame, regime: str = "sideways") -> tuple:
     """
-    Requiere volumen mínimo para confirmar señal.
-    Threshold dinámico por régimen:
-      bull/bear: 1.5x (convicción alta requerida)
-      sideways:  0.8x (mercado lateral tiene volumen estructuralmente bajo)
+    Volumen como ajuste de size, no como bloqueo binario.
+    - < 0.7x: skip (ruido puro)
+    - 0.7x-1.2x: entra con size * 0.75
+    - >= 1.2x: entra con size completo
+    Retorna (ok: bool, size_mult: float)
     """
     last = df.iloc[-1]
     if pd.isna(last.get("vol_ma20", float("nan"))) or last["vol_ma20"] == 0:
-        return True  # sin datos, no bloquear
+        return True, 1.0  # sin datos, no bloquear
     ratio = float(last["volume"]) / float(last["vol_ma20"])
-    threshold = 0.8 if regime == "sideways" else 1.5
-    if ratio < threshold:
-        log.info(f"  ⏭️  Volume conviction: {ratio:.1f}x promedio (mín {threshold}x en {regime}) — skip")
-        return False
-    log.info(f"  ✅ Volume conviction: {ratio:.1f}x promedio")
-    return True
+    if ratio < 0.7:
+        log.info(f"  ⏭️  Volume muy bajo: {ratio:.1f}x promedio — skip (ruido)")
+        return False, 0.0
+    elif ratio < 1.2:
+        log.info(f"  ⚠️  Volume medio: {ratio:.1f}x promedio — size reducido 25%")
+        return True, 0.75
+    else:
+        log.info(f"  ✅ Volume conviction: {ratio:.1f}x promedio")
+        return True, 1.0
 
 # ─────────────────────────────────────────
 # ANALIZAR UN PAR — motor principal
@@ -2379,39 +2393,90 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         "tech": t_sig, "macd": m_sig, "vol": v_sig, "tf4h": h_sig,
         "news": n_sig, "funding": fr_sig, "bb": bb_sig, "ob": ob_sig,
         "rsi_div": rsi_sig, "rsi_div_val": rsi_div,
-        # nuevas señales
+        # señales técnicas (peso 0 en score → usadas como filtros)
         "vwap": vwap_sig, "supertrend": st_sig, "stoch_rsi": stoch_sig,
         "williams_r": willy_sig, "cci": cci_sig, "squeeze": squeeze_sig,
         "support_res": sr_sig, "candle": candle_sig, "trend_struct": trend_sig,
     }
 
-    # Score ponderado por aprendizaje
+    # ── SCORE: solo señales con peso > 0 (trend + momentum + confirmation) ─
     score_float, score_int = weighted_score(signals, regime)
-    log.info(f"  [{timeframe}] EMA:{t_sig:+d} MACD:{m_sig:+d} BB:{bb_sig:+d} OB:{ob_sig:+d} RSIDiv:{rsi_sig:+d} VOL:{v_sig:+d} FR:{fr_sig:+d} NEWS:{n_sig:+d} VWAP:{vwap_sig:+d} ST:{st_sig:+d} STOCH:{stoch_sig:+d} WILLY:{willy_sig:+d} CCI:{cci_sig:+d} SQZ:{squeeze_sig:+d} SR:{sr_sig:+d} CANDLE:{candle_sig:+d} TREND:{trend_sig:+d} = {score_float:+.1f} (raw int={score_int:+d})")
 
-    # Score mínimo dinámico (régimen + RL)
-    # Sideways: threshold float 2.5 — ADA +2.7 entra, DOGE +1.7 no entra
-    # Bull/Bear: threshold int 2 — más permisivo
+    # ── Grupos de score para log legible ──────────────────────────────────
+    trend_score    = t_sig * 1.0 + st_sig * 1.3
+    momentum_score = m_sig * 1.0 + rsi_sig * 1.0
+    confirm_score  = vwap_sig * 1.2 + v_sig * 0.8 + trend_sig * 0.9
+
+    # C10: Log estructurado — siempre muestra los 3 grupos + decisión
+    log.info(
+        f"  [{timeframe}] trend={trend_score:+.1f}(EMA:{t_sig:+d} ST:{st_sig:+d}) "
+        f"momentum={momentum_score:+.1f}(MACD:{m_sig:+d} RSI▲:{rsi_sig:+d}) "
+        f"confirm={confirm_score:+.1f}(VWAP:{vwap_sig:+d} VOL:{v_sig:+d} TREND:{trend_sig:+d}) "
+        f"= {score_float:+.1f}"
+    )
+    log.info(
+        f"  [{timeframe}] ctx: BB:{bb_sig:+d} OB:{ob_sig:+d} FR:{fr_sig:+d} "
+        f"NEWS:{n_sig:+d} STOCH:{stoch_sig:+d} WILLY:{willy_sig:+d} "
+        f"CCI:{cci_sig:+d} SQZ:{squeeze_sig:+d} SR:{sr_sig:+d} CANDLE:{candle_sig:+d}"
+    )
+
+    # C5: News como filtro — noticias muy negativas bloquean, positivas ajustan size
+    if n_sig <= -1:
+        log.info(f"  ⏭️  News muy negativas ({n_sig}) — skip")
+        return
+    news_size_mult = 1.1 if n_sig >= 1 else 1.0
+
+    # C6: Funding como ajuste de size — no como señal de entrada
+    funding_size_mult = 1.0
+    if abs(fr_val) > 0.0005:
+        if fr_val > 0.0005:   funding_size_mult = 0.85   # funding alto → longs caros
+        elif fr_val < -0.0005: funding_size_mult = 1.1   # funding negativo → longs baratos
+
+    # C4: Order book como ajuste de size — no como voto del score
+    ob_bids = getattr(ob_sig, '__ob_bids__', None)
+    ob_size_mult = 1.0
+    if isinstance(ob_sig, (int, float)):
+        # ob_sig -1 = asks dominan, 0 = neutral, +1 = bids dominan
+        if ob_sig < 0: ob_size_mult = 0.8  # asks dominan → reducir size
+
+    # ── SCORE mínimo dinámico: RL acotado (C9) ──────────────────────────────
+    # RL puede mover el threshold ±0.5 máximo — no domina el sistema
     rl_min = rl_adjust_min_signals(state)
-    if regime == "sideways":
-        min_float = SIDEWAYS_MIN_FLOAT
-        if abs(score_float) < min_float:
-            log.info(f"  ⏭️  Score {score_float:+.1f} < {min_float} (sideways) — skip")
-            return
-    else:
-        min_score = max(MIN_SIGNALS, rl_min - 1)
-        if abs(score_int) < min_score:
-            log.info(f"  ⏭️  Score {score_int:+d} < {min_score} ({regime}) — skip")
-            return
+    rl_adjustment = (rl_min - MIN_SIGNALS_SIDEWAYS) * 0.2  # acotado al 20%
 
-    # Shorts habilitados en futuros — solo bloquear si SHORT_ENABLED=False
+    # C7: Sideways ajusta threshold, no cancela el sistema
+    if regime == "sideways":
+        min_threshold = SIDEWAYS_MIN_FLOAT + rl_adjustment
+    else:
+        min_threshold = float(max(MIN_SIGNALS, rl_min - 1)) + rl_adjustment
+
+    if abs(score_float) < min_threshold:
+        log.info(
+            f"  ⏭️  score={score_float:+.1f} < threshold={min_threshold:.1f} "
+            f"(régimen={regime} rl_adj={rl_adjustment:+.1f}) — skip"
+        )
+        return
+
+    # Shorts
     if score_float < 0 and not SHORT_ENABLED:
         log.info("  ⏭️  Bajista y shorts deshabilitados — skip")
         return
-    # Para shorts en altcoins 3m, requerir score ≤ SHORT_MIN_SCORE
     if timeframe == "3m" and score_float < 0 and score_float > SHORT_MIN_SCORE:
         log.info(f"  ⏭️  Short score {score_float:+.1f} insuficiente (mínimo {SHORT_MIN_SCORE}) — skip")
         return
+
+    # C8: Shorts selectivos — permitir short en activos débiles aunque BTC suba
+    direction_macro = "LONG" if score_float > 0 else "SHORT"
+    if direction_macro == "SHORT" and score_float < 0:
+        # Detectar debilidad relativa: si el activo cayó más que BTC en 24h
+        try:
+            ticker     = public_ex.fetch_ticker(symbol)
+            btc_ticker = public_ex.fetch_ticker("BTC/USDT")
+            asset_24h  = ticker.get("percentage", 0) or 0
+            btc_24h    = btc_ticker.get("percentage", 0) or 0
+            is_weak    = asset_24h < btc_24h - 2  # más de 2% peor que BTC
+        except:
+            is_weak = False
 
     # Correlación
     base_symbols = set(BASE_WATCHLIST)
@@ -2430,16 +2495,23 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         return
 
     # ── Filtro 1: Macro BTC 4h ──────────────────────────────────────────────
+    # C8: Shorts selectivos — activos débiles pueden shortearse aunque BTC suba
     direction_macro = "LONG" if score_float > 0 else "SHORT"
-    if not btc_macro_filter(public_ex, direction_macro):
-        return
+    if direction_macro == "SHORT" and not locals().get("is_weak", False):
+        if not btc_macro_filter(public_ex, direction_macro):
+            return
+    elif direction_macro == "LONG":
+        if not btc_macro_filter(public_ex, direction_macro):
+            return
+    # Si is_weak=True, short permitido aunque BTC esté alcista
 
     # ── Filtro 2: Pump/dump y liquidez ───────────────────────────────────────
     if not pump_dump_filter(df, symbol, fr_val):
         return
 
     # ── Filtro 3: Volumen de convicción ──────────────────────────────────────
-    if not volume_conviction_filter(df, regime):
+    vol_ok, vol_size_mult = volume_conviction_filter(df, regime)
+    if not vol_ok:
         return
 
     # Entry confirmation delay
@@ -2447,7 +2519,14 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         return
 
     effective_cap = get_effective_capital(state)
+    # Aplicar multiplicadores contextuales acumulados (C3, C4, C5, C6)
+    context_size_mult = vol_size_mult * news_size_mult * funding_size_mult * ob_size_mult
+    context_size_mult = max(0.5, min(1.3, context_size_mult))  # acotar entre 0.5x y 1.3x
+    if context_size_mult != 1.0:
+        log.info(f"  📐 Size mult contextual: {context_size_mult:.2f}x (vol={vol_size_mult:.2f} news={news_size_mult:.2f} fr={funding_size_mult:.2f} ob={ob_size_mult:.2f})")
+
     usd_size, risk_pct = get_position_size(effective_cap, score_int, regime)
+    usd_size = round(usd_size * context_size_mult, 2)
 
     if not can_open_position(open_positions, usd_size, effective_cap): return
     if not regime_filter(regime, "BUY" if score_int > 0 else "SELL"): return
