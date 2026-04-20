@@ -120,6 +120,10 @@ TF_CONTEXT  = "4h"
 TF_CONFIRM  = "15m"
 
 COOLDOWN_CANDLES  = 3
+# ── Filtros anti-sideways (v3.2) ─────────────────────────────────────────────
+ATR_COMPRESSION_THRESHOLD = 0.008  # ATR/price < 0.8% → mercado muerto, no entrar
+EMA_SLOPE_MIN             = 0.0003 # slope EMA50 mínimo para confirmar tendencia real
+POST_LOSS_COOLDOWN        = 5      # candles de espera después de un trade perdedor
 LOOP_SEC          = 60
 
 ARG_TZ = timezone(timedelta(hours=-3))
@@ -542,6 +546,53 @@ def get_market_context(exchange, regime: str, fg_value: int) -> Context:
 # ─────────────────────────────────────────
 # ENGINE DE ENTRADA — TIERS
 # ─────────────────────────────────────────
+# ─────────────────────────────────────────
+# FILTROS ANTI-SIDEWAYS (v3.2)
+# ─────────────────────────────────────────
+_post_loss_cooldown: dict = {}  # symbol → candles restantes post-pérdida
+
+def tick_post_loss_cooldowns():
+    for s in list(_post_loss_cooldown.keys()):
+        _post_loss_cooldown[s] -= 1
+        if _post_loss_cooldown[s] <= 0: del _post_loss_cooldown[s]
+
+def set_post_loss_cooldown(symbol: str):
+    """Activa cooldown post-pérdida para evitar re-entrar en lateral."""
+    _post_loss_cooldown[symbol] = POST_LOSS_COOLDOWN
+    log.info(f"  ⏳ Post-loss cooldown {symbol}: {POST_LOSS_COOLDOWN} ciclos")
+
+def check_anti_sideways_filters(df, symbol: str) -> tuple:
+    """
+    Filtros pre-entrada anti-sideways.
+    Retorna (ok: bool, reason: str)
+
+    1. Compresión ATR: ATR/price < threshold → mercado muerto
+    2. EMA slope débil: slope demasiado plano → tendencia falsa
+    3. Momentum obligatorio: M=0 en log → preludio de lateral
+    4. Post-loss cooldown: esperar N candles tras pérdida
+    """
+    last = df.iloc[-1]
+
+    # Filtro 1: Compresión ATR
+    atr   = float(last.get("atr", 0))
+    close = float(last["close"])
+    if close > 0 and atr > 0:
+        atr_ratio = atr / close
+        if atr_ratio < ATR_COMPRESSION_THRESHOLD:
+            return False, f"ATR comprimido ({atr_ratio*100:.3f}% < {ATR_COMPRESSION_THRESHOLD*100:.2f}%) — mercado muerto"
+
+    # Filtro 2: EMA slope débil
+    slope = abs(float(last.get("ema50_slope", 1)))
+    if slope < EMA_SLOPE_MIN:
+        return False, f"EMA50 slope plano ({slope:.6f} < {EMA_SLOPE_MIN}) — sin tendencia real"
+
+    # Filtro 3: Post-loss cooldown
+    if _post_loss_cooldown.get(symbol, 0) > 0:
+        remaining = _post_loss_cooldown[symbol]
+        return False, f"Post-loss cooldown: {remaining} ciclos restantes"
+
+    return True, "ok"
+
 def evaluate_entry(symbol, score_long, score_short, families_long, families_short,
                    context, fg_value, exchange, is_major) -> tuple:
     """
@@ -559,6 +610,10 @@ def evaluate_entry(symbol, score_long, score_short, families_long, families_shor
     # ── LONGS ────────────────────────────────────────────────────────────────
     if context != Context.RISK_OFF:
         if score_long == 3:
+            # Filtro: momentum obligatorio — M=0 es preludio de lateral
+            # families_long = (trend, momentum, volume)
+            if families_long[1] == 0:
+                return None, Tier.NONE, "Tier A bloqueado: momentum=0 (preludio lateral)"
             return "BUY", Tier.A, "score=3/3 Tier A"
 
         if score_long == 2 and context == Context.BULL:
@@ -732,6 +787,9 @@ def update_trailing_stops(exchange, state):
                 usd_pnl   = round(pnl * pos["usd_size"] / 100, 2)
                 state["capital"] = round(state.get("capital", CAPITAL_TOTAL_USD) + usd_pnl, 2)
                 save_state(state)
+                # Post-loss cooldown: si perdió, esperar antes de re-entrar
+                if pnl < 0:
+                    set_post_loss_cooldown(symbol)
                 emoji = "🟢" if pnl > 0 else "🔴"
                 log.info(f"  {emoji} CERRADA {symbol} Tier {pos.get('tier','?')} "
                          f"@ {price:.6f} | PnL: {pnl:+.2f}% ({usd_pnl:+.2f}) | {exit_reason}")
@@ -811,6 +869,12 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
 
     fam_long  = {"trend": t_long,  "momentum": m_long,  "volume": v_long}
     fam_short = {"trend": t_short, "momentum": m_short, "volume": v_short}
+
+    # Filtros anti-sideways (v3.2) — antes de evaluar tier
+    asf_ok, asf_reason = check_anti_sideways_filters(df, symbol)
+    if not asf_ok:
+        log.info(f"  ⏭️  Anti-sideways: {asf_reason}")
+        return
 
     # Motor de entrada
     action, tier, reason = evaluate_entry(
@@ -1659,6 +1723,7 @@ def run_bot():
             log.info("🛑 v3 Circuit breaker — skip entradas")
             update_trailing_stops(pub, state)
             tick_cooldowns()
+            tick_post_loss_cooldowns()
             log.info(f"💤 {LOOP_SEC}s...")
             time.sleep(LOOP_SEC)
             continue
