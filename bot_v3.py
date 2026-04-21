@@ -127,7 +127,8 @@ ARG_TZ = timezone(timedelta(hours=-3))
 
 EXCLUDE_SYMBOLS = {
     "USDT","USDC","BUSD","DAI","TUSD","FDUSD","USDP","USD1","RLUSD","EUR",
-    "WBTC","WETH","STETH","BETH","BTC","ETH","SOL","BNB","LDUSDT","XAUT","PAXG"
+    "WBTC","WETH","STETH","BETH","BTC","ETH","SOL","BNB","LDUSDT","XAUT","PAXG",
+    "DASH"  # delisted en Binance
 }
 
 # ─────────────────────────────────────────
@@ -788,6 +789,7 @@ def check_daily_circuit(state) -> bool:
 # ANÁLISIS PRINCIPAL
 # ─────────────────────────────────────────
 def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
+    regime_val = regime  # alias para compatibilidad interna
     positions = load_positions()
     if symbol in positions:
         log.info(f"  {symbol}: posición ya abierta — skip")
