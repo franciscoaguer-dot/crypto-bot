@@ -120,10 +120,7 @@ TF_CONTEXT  = "4h"
 TF_CONFIRM  = "15m"
 
 COOLDOWN_CANDLES  = 3
-# ── Filtros anti-sideways (v3.2) ─────────────────────────────────────────────
-ATR_COMPRESSION_THRESHOLD = 0.008  # ATR/price < 0.8% → mercado muerto, no entrar
-EMA_SLOPE_MIN             = 0.0003 # slope EMA50 mínimo para confirmar tendencia real
-POST_LOSS_COOLDOWN        = 5      # candles de espera después de un trade perdedor
+# v3.3: lógica simplificada — sin filtros ATR/slope contradictorios
 LOOP_SEC          = 60
 
 ARG_TZ = timezone(timedelta(hours=-3))
@@ -549,50 +546,6 @@ def get_market_context(exchange, regime: str, fg_value: int) -> Context:
 # ─────────────────────────────────────────
 # FILTROS ANTI-SIDEWAYS (v3.2)
 # ─────────────────────────────────────────
-_post_loss_cooldown: dict = {}  # symbol → candles restantes post-pérdida
-
-def tick_post_loss_cooldowns():
-    for s in list(_post_loss_cooldown.keys()):
-        _post_loss_cooldown[s] -= 1
-        if _post_loss_cooldown[s] <= 0: del _post_loss_cooldown[s]
-
-def set_post_loss_cooldown(symbol: str):
-    """Activa cooldown post-pérdida para evitar re-entrar en lateral."""
-    _post_loss_cooldown[symbol] = POST_LOSS_COOLDOWN
-    log.info(f"  ⏳ Post-loss cooldown {symbol}: {POST_LOSS_COOLDOWN} ciclos")
-
-def check_anti_sideways_filters(df, symbol: str) -> tuple:
-    """
-    Filtros pre-entrada anti-sideways.
-    Retorna (ok: bool, reason: str)
-
-    1. Compresión ATR: ATR/price < threshold → mercado muerto
-    2. EMA slope débil: slope demasiado plano → tendencia falsa
-    3. Momentum obligatorio: M=0 en log → preludio de lateral
-    4. Post-loss cooldown: esperar N candles tras pérdida
-    """
-    last = df.iloc[-1]
-
-    # Filtro 1: Compresión ATR
-    atr   = float(last.get("atr", 0))
-    close = float(last["close"])
-    if close > 0 and atr > 0:
-        atr_ratio = atr / close
-        if atr_ratio < ATR_COMPRESSION_THRESHOLD:
-            return False, f"ATR comprimido ({atr_ratio*100:.3f}% < {ATR_COMPRESSION_THRESHOLD*100:.2f}%) — mercado muerto"
-
-    # Filtro 2: EMA slope débil
-    slope = abs(float(last.get("ema50_slope", 1)))
-    if slope < EMA_SLOPE_MIN:
-        return False, f"EMA50 slope plano ({slope:.6f} < {EMA_SLOPE_MIN}) — sin tendencia real"
-
-    # Filtro 3: Post-loss cooldown
-    if _post_loss_cooldown.get(symbol, 0) > 0:
-        remaining = _post_loss_cooldown[symbol]
-        return False, f"Post-loss cooldown: {remaining} ciclos restantes"
-
-    return True, "ok"
-
 def evaluate_entry(symbol, score_long, score_short, families_long, families_short,
                    context, fg_value, exchange, is_major) -> tuple:
     """
@@ -787,9 +740,7 @@ def update_trailing_stops(exchange, state):
                 usd_pnl   = round(pnl * pos["usd_size"] / 100, 2)
                 state["capital"] = round(state.get("capital", CAPITAL_TOTAL_USD) + usd_pnl, 2)
                 save_state(state)
-                # Post-loss cooldown: si perdió, esperar antes de re-entrar
-                if pnl < 0:
-                    set_post_loss_cooldown(symbol)
+
                 emoji = "🟢" if pnl > 0 else "🔴"
                 log.info(f"  {emoji} CERRADA {symbol} Tier {pos.get('tier','?')} "
                          f"@ {price:.6f} | PnL: {pnl:+.2f}% ({usd_pnl:+.2f}) | {exit_reason}")
@@ -870,12 +821,6 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
     fam_long  = {"trend": t_long,  "momentum": m_long,  "volume": v_long}
     fam_short = {"trend": t_short, "momentum": m_short, "volume": v_short}
 
-    # Filtros anti-sideways (v3.2) — antes de evaluar tier
-    asf_ok, asf_reason = check_anti_sideways_filters(df, symbol)
-    if not asf_ok:
-        log.info(f"  ⏭️  Anti-sideways: {asf_reason}")
-        return
-
     # Motor de entrada
     action, tier, reason = evaluate_entry(
         symbol, score_long, score_short, fam_long, fam_short,
@@ -913,7 +858,7 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
         return False
 
     # Sizing
-    usd_size = get_size(capital, symbol, tier, context, regime, fg_value)
+    usd_size = get_size(capital, symbol, tier, context, regime_val, fg_value)
     if usd_size < 5:
         log.info(f"  ⏭️  Size demasiado pequeño (${usd_size})")
         return False
@@ -932,7 +877,7 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
             f"📝 <b>v3 PAPER {action} {symbol}</b> [Tier {tier.value}]\n"
             f"Score: {score}/3 | Contexto: {context.value.upper()}\n"
             f"Precio: {price:.6f} | Size: ${usd_size}\n"
-            f"F&G: {fg_value} | Régimen: {regime}\n"
+            f"F&G: {fg_value} | Régimen: {regime_val}\n"
             f"Motivo: {reason}"
         )
         # Actualizar contador de tiers en state
@@ -1207,6 +1152,16 @@ footer{text-align:center;font-size:9px;color:var(--text2);margin-top:14px;paddin
     <div class="kpi-val p" id="k-pf">—</div>
     <div class="kpi-sub">wins/losses</div>
   </div>
+  <div class="kpi" style="--ka:var(--red)">
+    <div class="kpi-label">F&amp;G</div>
+    <div class="kpi-val" id="k-fg">—</div>
+    <div class="kpi-sub" id="k-fg-l">—</div>
+  </div>
+  <div class="kpi" style="--ka:var(--blue)">
+    <div class="kpi-label">Régimen</div>
+    <div class="kpi-val b" id="k-regime">—</div>
+    <div class="kpi-sub" id="k-ctx">—</div>
+  </div>
 </div>
 
 <!-- GRID PRINCIPAL -->
@@ -1435,7 +1390,21 @@ async function load(){
     // ── Capital KPI ──
     document.getElementById('k-cap').textContent = '$'+fmt(cap);
     document.getElementById('k-cap').className = 'kpi-val '+(cap>=ICAP?'g':'r');
-    document.getElementById('k-cap-d').textContent = (cap-ICAP>=0?'+':'')+fmt(cap-ICAP)+' desde inicio';
+    const diff = cap-ICAP;
+    document.getElementById('k-cap-d').textContent = (diff>=0?'+':'')+fmt(diff)+' desde inicio';
+
+    // ── Régimen y contexto en header ──
+    const reg = d.regime||'—';
+    const ctx = d.context||'—';
+    const fg  = d.fear_greed||{};
+    document.getElementById('k-regime').textContent = reg.toUpperCase();
+    document.getElementById('k-ctx').textContent    = ctx.toUpperCase();
+    if(fg.value){
+      const fv = +fg.value;
+      const fc = fv<35?'r':fv>65?'g':'y';
+      document.getElementById('k-fg').textContent   = fv+' — '+fg.label;
+      document.getElementById('k-fg').className     = 'kpi-val '+fc;
+    }
 
     // ── P&L ──
     const tpnl = closed.reduce((s,t)=>s+(t.pnl_pct||0)*(t.usd_size||20)/100,0);
@@ -1723,7 +1692,6 @@ def run_bot():
             log.info("🛑 v3 Circuit breaker — skip entradas")
             update_trailing_stops(pub, state)
             tick_cooldowns()
-            tick_post_loss_cooldowns()
             log.info(f"💤 {LOOP_SEC}s...")
             time.sleep(LOOP_SEC)
             continue
