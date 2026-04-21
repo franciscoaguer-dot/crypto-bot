@@ -102,7 +102,7 @@ ATR_MULT          = 1.5
 
 # Señales
 MACD_THRESHOLD    = 0.5     # abs(hist) > mean10 * this
-VOL_MULT          = 1.3
+VOL_MULT          = 1.1   # v3.3: bajado de 1.3 → menos restrictivo
 BODY_ATR_MULT     = 1.2
 VWAP_PERIODS      = 24
 
@@ -395,13 +395,21 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
 # LAS 3 FAMILIAS
 # ─────────────────────────────────────────
 def family_trend(df) -> int:
-    last = df.iloc[-1]
+    """
+    v3.3: suavizado — no exige slope positivo, solo precio vs EMA50 + supertrend.
+    El slope era demasiado restrictivo en acumulación/consolidación sana.
+    """
+    last   = df.iloc[-1]
     st_dir = int(last.get("supertrend_dir", 0))
     close  = float(last["close"])
     ema50  = float(last["ema50"])
-    slope  = float(last.get("ema50_slope", 0))
-    if st_dir == 1 and close > ema50 and slope > 0:   return +1
-    if st_dir == -1 and close < ema50 and slope < 0:  return -1
+    # Solo necesita 1 de 2: supertrend O precio vs EMA50
+    bull_signals = (1 if st_dir == 1 else 0) + (1 if close > ema50 else 0)
+    bear_signals = (1 if st_dir == -1 else 0) + (1 if close < ema50 else 0)
+    if bull_signals >= 2: return +1   # ambos alineados → señal fuerte
+    if bull_signals == 1 and st_dir == 1: return +1  # supertrend > EMA50
+    if bear_signals >= 2: return -1
+    if bear_signals == 1 and st_dir == -1: return -1
     return 0
 
 def family_momentum(df) -> int:
@@ -423,21 +431,15 @@ def family_momentum(df) -> int:
     # Threshold suave: 30% del threshold normal para capturar giros tempranos
     threshold_soft = mean10 * MACD_THRESHOLD * 0.3
 
-    # ── LONG momentum ───────────────────────────────────────────────────────
-    # Fuerte: hist claramente positivo y creciendo
-    if hist > 0 and hist > hist_prev and abs(hist) > threshold:
-        return +1
-    # Suave: hist negativo pero acelerando hacia arriba con convicción
-    # (histograma bajista que gira → señal temprana de reversión)
-    if hist < 0 and hist > hist_prev and (hist_prev - hist) > threshold_soft:
+    # ── LONG momentum ────────────────────────────────────────────────────────
+    # v3.3: solo requiere dirección, no magnitud
+    # hist creciendo (cualquier magnitud) = momentum alcista
+    if hist > hist_prev:
         return +1
 
-    # ── SHORT momentum ──────────────────────────────────────────────────────
-    # Fuerte: hist claramente negativo y cayendo
-    if hist < 0 and hist < hist_prev and abs(hist) > threshold:
-        return -1
-    # Suave: hist positivo pero cayendo con convicción
-    if hist > 0 and hist < hist_prev and (hist - hist_prev) > threshold_soft:
+    # ── SHORT momentum ───────────────────────────────────────────────────────
+    # hist cayendo = momentum bajista
+    if hist < hist_prev:
         return -1
 
     return 0
@@ -518,24 +520,23 @@ def get_market_context(exchange, regime: str, fg_value: int) -> Context:
             log.warning(f"  BTC 4h context error: {e}")
 
     btc_bull = _btc4h_cache.get("bull", True)
-    is_crash = regime == "crash"
 
-    # RISK_OFF: BTC bajista O crash — F&G ya no lo baja a RISK_OFF
-    if not btc_bull or is_crash:
+    # v3.3: UNA sola fuente de verdad — régimen eliminado del contexto
+    # BULL:     BTC 4h > EMA21 AND F&G > FG_RISK_OFF_MAX
+    # RISK_OFF: BTC 4h < EMA21
+    # NEUTRAL:  BTC alcista pero F&G bajo
+    if not btc_bull:
         ctx = Context.RISK_OFF
-    # BULL: BTC alcista + régimen no crash
-    # F&G bajo (< FG_BULL_MIN) → sigue siendo BULL pero con subtype CAUTIOUS
-    # El sizing se ajusta en get_size(), no acá
-    elif btc_bull and regime in ("bull", "sideways", "bear"):
+    elif btc_bull and fg_value > FG_RISK_OFF_MAX:
         ctx = Context.BULL
     else:
-        ctx = Context.NEUTRAL
+        ctx = Context.NEUTRAL  # BTC alcista pero F&G muy bajo → cautious
 
     # Subtype para logging y sizing
     cautious = fg_value < FG_BULL_MIN and ctx == Context.BULL
     subtype  = " CAUTIOUS" if cautious else ""
     log.info(f"  📊 Contexto: {ctx.value.upper()}{subtype} "
-             f"(BTC4h={'↑' if btc_bull else '↓'} | F&G={fg_value} | régimen={regime})")
+             f"(BTC4h={'↑' if btc_bull else '↓'} | F&G={fg_value})")
 
     # Guardar subtype en cache para que get_size lo use
     _btc4h_cache["cautious"] = cautious
@@ -599,11 +600,11 @@ def evaluate_entry(symbol, score_long, score_short, families_long, families_shor
 def get_size(capital: float, symbol: str, tier: Tier,
              context: Context, regime: str, fg_value: int) -> float:
     """
-    Sizing dinámico por tier, contexto y tipo de activo.
+    Sizing dinámico por tier y contexto. v3.3: regime ignorado.
     """
     is_major = symbol in MAJORS
     asset_type = "major" if is_major else "alt"
-    sideways = regime == "sideways"
+    sideways = False  # v3.3: régimen unificado en contexto
 
     key = (tier, asset_type, context)
     pct = SIZE.get(key, SIZE_DEFAULT)
@@ -1681,11 +1682,10 @@ def run_bot():
 
         state = load_state()
 
-        # Régimen cada 15 min
+        # v3.3: régimen simplificado — contexto es la fuente de verdad
         if now - last_regime > 900:
-            _v3_regime  = detect_regime(pub)
+            _v3_regime  = "bull"   # ya no se usa para lógica, solo para API/display
             last_regime = now
-            log.info(f"🧭 Régimen: {_v3_regime.upper()}")
 
         # Fear & Greed
         fg_val, fg_label = get_fear_greed()
