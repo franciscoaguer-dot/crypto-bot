@@ -2607,13 +2607,28 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
                 send_telegram(f"{'🚀' if use_futures else '✅'} <b>{mode_label}</b> — {symbol} @ {actual}\n💰 ${usd_size}×{leverage}")
 
     elif analysis["action"] == "SELL" and analysis["confidence"] >= CONFIDENCE_MIN:
-        if not use_futures:
+        # v10 fix: permitir shorts en futuros para majors con score fuerte
+        # aunque el timeframe base sea spot (1h), si el score es ≤ -2.5 y es major
+        is_major_sym = any(symbol.startswith(m) for m in ["BTC", "ETH", "SOL", "BNB"])
+        major_short_ok = (
+            is_major_sym
+            and score_float <= -2.5
+            and regime in ("sideways", "bear", "crash")
+        )
+        if not use_futures and not major_short_ok:
             log.info("  ⏭️  SELL requiere futuros — skip")
             return
+        if not use_futures and major_short_ok:
+            # Forzar futuros para short en major con score fuerte
+            use_futures = True
+            usd_size    = round(usd_size * 0.75, 2)  # size reducido 25%
+            mode_label  = f"FUTURES {FUTURES_LEVERAGE}x"
+            log.info(f"  ⚡ Major short habilitado: score={score_float:+.1f} régimen={regime} size=${usd_size}")
         if PAPER_TRADING:
             save_trade({**base_record, "paper": True, "order_id": None})
             open_position(symbol, current_price, usd_size, risk_pct, "SELL", timeframe, mode_label, signals_snap, atr_value)
-            log.info(f"  📝 PAPER SHORT {mode_label} @ {current_price} | ATR={atr_value:.4f if atr_value else 'N/A'}")
+            atr_str = f'{atr_value:.4f}' if atr_value else 'N/A'
+            log.info(f"  📝 PAPER SHORT {mode_label} @ {current_price} | ATR={atr_str}")
             send_telegram(
                 f"📉 <b>PAPER SHORT {mode_label} [{timeframe}]</b>\n"
                 f"<b>{symbol}</b> @ {current_price}\n"
