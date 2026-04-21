@@ -1395,18 +1395,8 @@ async function load(){
     const diff = cap-ICAP;
     document.getElementById('k-cap-d').textContent = (diff>=0?'+':'')+fmt(diff)+' desde inicio';
 
-    // ── Régimen y contexto en header ──
-    const reg = d.regime||'—';
-    const ctx = d.context||'—';
-    const fg  = d.fear_greed||{};
-    document.getElementById('k-regime').textContent = reg.toUpperCase();
-    document.getElementById('k-ctx').textContent    = ctx.toUpperCase();
-    if(fg.value){
-      const fv = +fg.value;
-      const fc = fv<35?'r':fv>65?'g':'y';
-      document.getElementById('k-fg').textContent   = fv+' — '+fg.label;
-      document.getElementById('k-fg').className     = 'kpi-val '+fc;
-    }
+    // ── KPIs de F&G y Régimen (usa variables declaradas más abajo) ──
+    // (se actualizan en el bloque de Régimen más abajo)
 
     // ── P&L ──
     const tpnl = closed.reduce((s,t)=>s+(t.pnl_pct||0)*(t.usd_size||20)/100,0);
@@ -1461,6 +1451,19 @@ async function load(){
     const rm={bull:'BULL 📈',bear:'BEAR 📉',sideways:'SIDE ↔',crash:'CRASH 💥'};
     const reg = d.regime||'?';
     document.getElementById('sub-regime').textContent = 'régimen '+(rm[reg]||reg);
+    // KPIs de régimen y F&G
+    const regEl = document.getElementById('k-regime');
+    if(regEl) regEl.textContent = reg.toUpperCase();
+    const ctxKpi = document.getElementById('k-ctx');
+    if(ctxKpi) ctxKpi.textContent = (d.context||'—').toUpperCase();
+    if(d.fear_greed && d.fear_greed.value){
+      const fv = +d.fear_greed.value;
+      const fgEl = document.getElementById('k-fg');
+      if(fgEl){
+        fgEl.textContent = fv+' — '+d.fear_greed.label;
+        fgEl.className = 'kpi-val '+(fv<35?'r':fv>65?'g':'y');
+      }
+    }
 
     // ── Contexto badge ──
     const ctx = (d.context||'neutral').toLowerCase();
