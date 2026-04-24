@@ -74,6 +74,8 @@ TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 MAJORS = {"BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"}
+# Pares cruzados con edge demostrado en backtest (SOL/ETH WR 42%, AVAX/ETH WR 41%)
+CROSS_PAIRS = ["SOL/ETH", "AVAX/ETH", "SOL/BTC"]
 
 # Sizing por tier y contexto
 SIZE = {
@@ -349,6 +351,7 @@ def get_ohlcv(exchange, symbol, timeframe="1h", limit=100):
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    df["ema9"]  = df["close"].ewm(span=9,  adjust=False).mean()
     df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     df["ema50_slope"] = df["ema50"].diff(3) / df["ema50"].shift(3)
@@ -389,6 +392,23 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
             st_dir.iloc[i] = st_dir.iloc[i-1]
             st.iloc[i] = lower.iloc[i] if st_dir.iloc[i] == 1 else upper.iloc[i]
     df["supertrend_dir"] = st_dir
+
+    # ADX — fuerza de tendencia (filtro clave del backtest)
+    try:
+        plus_dm  = df["high"].diff().clip(lower=0)
+        minus_dm = (-df["low"].diff()).clip(lower=0)
+        plus_dm  = plus_dm.where(plus_dm > (-df["low"].diff()).clip(lower=0), 0)
+        minus_dm = minus_dm.where(minus_dm > df["high"].diff().clip(lower=0), 0)
+        tr2 = pd.concat([df["high"]-df["low"],
+                         (df["high"]-df["close"].shift()).abs(),
+                         (df["low"]-df["close"].shift()).abs()], axis=1).max(axis=1)
+        atr14    = tr2.ewm(span=14, adjust=False).mean()
+        plus_di  = 100 * plus_dm.ewm(span=14, adjust=False).mean() / atr14
+        minus_di = 100 * minus_dm.ewm(span=14, adjust=False).mean() / atr14
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, 1)
+        df["adx"] = dx.ewm(span=14, adjust=False).mean()
+    except Exception:
+        df["adx"] = 25.0
     return df
 
 # ─────────────────────────────────────────
@@ -810,6 +830,12 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
         log.warning(f"  OHLCV error {symbol}: {e}")
         return False
 
+    # ADX: no operar en mercados sin tendencia (< 20 = lateral)
+    adx_now = float(df["adx"].iloc[-1]) if "adx" in df.columns and not pd.isna(df["adx"].iloc[-1]) else 25.0
+    if adx_now < 20:
+        log.info(f"  ⏭️  ADX={adx_now:.1f} < 20 — lateral, skip")
+        return False
+
     # Calcular familias
     t_long = family_trend(df)
     m_long = family_momentum(df)
@@ -858,6 +884,16 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
     alt_limit = 999 if tier == Tier.A else 5
     if not is_major and len(open_alts) >= alt_limit:
         log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas (límite Tier B={alt_limit})")
+        return False
+
+    # EMA alignment: confirmar dirección en el par
+    ema9_v  = float(df["ema9"].iloc[-1])  if "ema9"  in df.columns else 0
+    ema21_v = float(df["ema21"].iloc[-1]) if "ema21" in df.columns else 0
+    if action == "BUY"  and not (ema9_v > ema21_v):
+        log.info(f"  ⏭️  EMA alignment: EMA9({ema9_v:.4f}) < EMA21({ema21_v:.4f}) para LONG — skip")
+        return False
+    if action == "SELL" and not (ema9_v < ema21_v):
+        log.info(f"  ⏭️  EMA alignment: EMA9({ema9_v:.4f}) > EMA21({ema21_v:.4f}) para SHORT — skip")
         return False
 
     # Sizing
@@ -1473,9 +1509,10 @@ async function load(){
       'bull':'🟢 BULL', 'bull cautious':'🟡 BULL CAUTIOUS',
       'neutral':'🔵 NEUTRAL', 'risk_off':'🔴 RISK-OFF'
     };
-    const ctxClass = ctx.includes('cautious')?'bull-cautious':ctx.replace(' ','_').replace('off','off');
-    cb.className = 'ctx-badge ctx-'+(ctx.startsWith('bull')?ctx.includes('cautious')?'bull-cautious':'bull':ctx);
-    cb.textContent = ctxMap[ctx]||ctx.toUpperCase();
+    if(cb){
+      cb.className = 'ctx-badge ctx-'+(ctx.startsWith('bull')?ctx.includes('cautious')?'bull-cautious':'bull':ctx);
+      cb.textContent = ctxMap[ctx]||ctx.toUpperCase();
+    }
 
     // ── Curva de capital ──
     const pts = buildCapCurve(closed);
@@ -1525,7 +1562,7 @@ async function load(){
         : Math.max(0,Math.min(100,(curr-entry)/(tp-entry)*100));
       return `<div class="pos-card ${isS?'short':'long'} ${tierCls}">
         <div class="pos-top">
-          <div><span class="pos-sym">${p.symbol.replace('/USDT','')}</span><span class="pos-tier-badge">Tier ${p.tier||'?'}</span></div>
+          <div><span class="pos-sym">${p.symbol.replace('/USDT','').replace('/ETH','·ETH').replace('/BTC','·BTC')}</span><span class="pos-tier-badge">Tier ${p.tier||'?'}</span></div>
           <span class="pos-pnl ${isPos?'pos':'neg'}">${fmtPct(pnlPct)}</span>
         </div>
         <div class="pos-grid">
@@ -1723,10 +1760,19 @@ def run_bot():
             except Exception as e:
                 log.error(f"Error {symbol}: {e}")
 
+        # Cross pairs (edge demostrado: SOL/ETH WR 42%, AVAX/ETH WR 41%, SOL/BTC WR 33%)
+        log.info(f"\n--- CROSS PAIRS [{TF_SETUP}] ---")
+        for symbol in CROSS_PAIRS:
+            try:
+                log.info(f"\n📊 {symbol}...")
+                analyze_symbol(symbol, pub, _v3_regime, fg_val, state, ctx)
+            except Exception as e:
+                log.error(f"Error {symbol}: {e}")
+
         # Altcoins (solo si no es RISK_OFF)
         if ctx != Context.RISK_OFF:
             alts = scan_altcoins(pub)
-            _v3_scanner = alts
+            _v3_scanner = CROSS_PAIRS + alts  # cross pairs siempre visibles
             log.info(f"\n--- ALTCOINS [{TF_SETUP}] ---")
             for symbol in alts:
                 try:
