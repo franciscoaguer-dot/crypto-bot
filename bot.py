@@ -483,7 +483,7 @@ def check_drawdown(state):
 
 def trading_hours_filter() -> bool:
     """No operar entre 00:00 y 06:00 UTC — volumen bajo, spreads amplios."""
-    hour_utc = datetime.utcnow().hour
+    hour_utc = datetime.now(timezone.utc).hour
     if 0 <= hour_utc < 6:
         log.info(f"  ⏭️  Hora UTC {hour_utc:02d}:xx — fuera de horario (00-06 UTC)")
         return False
@@ -2507,15 +2507,25 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         return
 
     # ── Filtro 1: Macro BTC 4h ──────────────────────────────────────────────
-    # C8: Shorts selectivos — activos débiles pueden shortearse aunque BTC suba
+    # Macro filter v2: tolerancia dinámica por score
+    # SHORT fuerte (score <= -3.0) → permitido aunque BTC sea alcista
+    # SHORT débil (score > -3.0) → requiere BTC bajista
+    # LONG débil → requiere BTC alcista siempre
     direction_macro = "LONG" if score_float > 0 else "SHORT"
-    if direction_macro == "SHORT" and not locals().get("is_weak", False):
-        if not btc_macro_filter(public_ex, direction_macro):
-            return
+    is_weak = locals().get("is_weak", False)
+    is_strong_short = score_float <= -3.0  # señal bajista muy fuerte
+
+    if direction_macro == "SHORT":
+        if is_strong_short:
+            log.info(f"  ✅ Macro filter: short fuerte ({score_float:.1f}) — permitido aunque BTC alcista")
+        elif is_weak:
+            log.info(f"  ✅ Macro filter: activo débil vs BTC — short permitido")
+        else:
+            if not btc_macro_filter(public_ex, direction_macro):
+                return
     elif direction_macro == "LONG":
         if not btc_macro_filter(public_ex, direction_macro):
             return
-    # Si is_weak=True, short permitido aunque BTC esté alcista
 
     # ── Filtro 2: Pump/dump y liquidez ───────────────────────────────────────
     if not pump_dump_filter(df, symbol, fr_val):
