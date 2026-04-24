@@ -93,12 +93,12 @@ MAX_EXPOSURE      = 0.20    # máx 20% capital total
 MAX_ALTS_OPEN     = 5
 
 # Risk management
-STOP_LOSS_PCT     = 0.025
+STOP_LOSS_PCT     = 0.030  # 3% para 4h
 BINANCE_FEE_RT    = 0.001   # 0.1% entrada + 0.1% salida = 0.2% round-trip (spot)
                              # Con BNB: 0.075% × 2 = 0.15% — conservador usar 0.2%
-TRAILING_PCT      = 0.012
-TP_PCT            = 0.030
-TP_PARTIAL_PCT    = 0.018
+TRAILING_PCT      = 0.025  # 2.5% para 4h
+TP_PCT            = 0.050  # 5% para 4h
+TP_PARTIAL_PCT    = 0.030  # 3% para 4h
 PARTIAL_SIZE      = 0.50
 ATR_MULT          = 1.5
 
@@ -117,9 +117,9 @@ FG_GREED_MAX      = 75      # euforia → reducir size
 MIN_VOL_24H       = 10_000_000  # bajado de 20M → más pares califican
 
 # Timeframes
-TF_SETUP    = "1h"
+TF_SETUP    = "4h"   # v3.4: 4h elimina ruido (PF +30% en backtest)
 TF_CONTEXT  = "4h"
-TF_CONFIRM  = "15m"
+TF_CONFIRM  = "1h"   # v3.4: confirm 1h cuando setup es 4h
 
 COOLDOWN_CANDLES  = 3
 # v3.3: lógica simplificada — sin filtros ATR/slope contradictorios
@@ -677,10 +677,10 @@ def open_position(symbol, entry_price, usd_size, action, atr_value, tier, contex
 
     # FIX 2: Trail más amplio en sideways para evitar stops prematuros
     # Backtest mostró 175 trades cerrados innecesariamente por trail < 1.5% loss
-    base_trail = 0.020 if regime == "sideways" else TRAILING_PCT  # 2% en sideways, 1.2% en tendencia
+    base_trail = 0.030 if regime == "sideways" else TRAILING_PCT  # v3.4: 3% sideways, 2.5% tendencia (4h)
     trail_pct  = max((atr_value * ATR_MULT / entry_price) if atr_value else base_trail,
                       base_trail)
-    trail_pct  = min(trail_pct, 0.04)  # máximo 4% (antes 3%)
+    trail_pct  = min(trail_pct, 0.05)  # v3.4: máximo 5% para 4h
 
     if is_short:
         trail_stop  = round(entry_price * (1 + trail_pct), 8)
@@ -1677,6 +1677,7 @@ def v3_log():
     return jsonify(list(_log_buffer))
 
 @flask_v3.route("/health")
+@flask_v3.route("/api/health")
 def v3_health():
     return jsonify({"status": "ok", "version": "v3", "paper": PAPER_TRADING})
 
