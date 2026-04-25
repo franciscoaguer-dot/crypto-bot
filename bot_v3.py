@@ -443,9 +443,11 @@ def family_momentum(df) -> int:
     -1 (suave):    hist positivo pero cayendo claramente
      0:            sin señal clara
     """
+    if len(df) < 2:
+        return 0
     last = df.iloc[-1]; prev = df.iloc[-2]
-    hist      = float(last["macd_hist"])
-    hist_prev = float(prev["macd_hist"])
+    hist      = float(last["macd_hist"]) if not pd.isna(last["macd_hist"]) else 0
+    hist_prev = float(prev["macd_hist"]) if not pd.isna(prev["macd_hist"]) else 0
     mean10    = float(last.get("macd_hist_mean10", 1e-9)) or 1e-9
     threshold = mean10 * MACD_THRESHOLD
     # Threshold suave: 30% del threshold normal para capturar giros tempranos
@@ -569,7 +571,7 @@ def get_market_context(exchange, regime: str, fg_value: int) -> Context:
 # FILTROS ANTI-SIDEWAYS (v3.2)
 # ─────────────────────────────────────────
 def evaluate_entry(symbol, score_long, score_short, families_long, families_short,
-                   context, fg_value, exchange, is_major) -> tuple:
+                   context, fg_value, exchange, is_major, regime="bull") -> tuple:
     """
     Motor de decisión de entrada por tiers.
 
@@ -587,7 +589,8 @@ def evaluate_entry(symbol, score_long, score_short, families_long, families_shor
         if score_long == 3:
             # Filtro: momentum obligatorio — M=0 es preludio de lateral
             # families_long = (trend, momentum, volume)
-            if families_long[1] == 0:
+            if (isinstance(families_long, (tuple, list)) and families_long[1] == 0) or \
+               (isinstance(families_long, dict) and families_long.get("momentum", 0) == 0):
                 return None, Tier.NONE, "Tier A bloqueado: momentum=0 (preludio lateral)"
             return "BUY", Tier.A, "score=3/3 Tier A"
 
@@ -826,6 +829,9 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
 
     try:
         df = calculate_indicators(get_ohlcv(exchange, symbol, TF_SETUP, limit=100))
+        if df is None or len(df) < 50:
+            log.info(f"  ⏭️  {symbol}: datos insuficientes ({len(df) if df is not None else 0} velas)")
+            return False
     except Exception as e:
         log.warning(f"  OHLCV error {symbol}: {e}")
         return False
@@ -853,7 +859,7 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
     # Motor de entrada
     action, tier, reason = evaluate_entry(
         symbol, score_long, score_short, fam_long, fam_short,
-        context, fg_value, exchange, is_major
+        context, fg_value, exchange, is_major, regime=regime_val
     )
 
     # Log estructurado de la decisión
@@ -1697,7 +1703,8 @@ def run_bot():
     log.info("=" * 55)
     log.info(f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     log.info("Tier A: 3/3 → entrada fuerte")
-    log.info("Tier B: 2/3 + confirmación 15m → entrada reducida (solo en BULL)")
+    log.info("Tier B: 2/3 + confirmación 1h → entrada reducida (solo en BULL)")
+    log.info("=== v3.4.2 LOADED — ADX, EMA9 alignment, cross pairs ===")
     log.info("Contexto: BULL / NEUTRAL / RISK_OFF (modificador dinámico)")
 
     send_telegram(
@@ -1759,7 +1766,9 @@ def run_bot():
                 log.info(f"\n📊 {symbol}...")
                 analyze_symbol(symbol, pub, _v3_regime, fg_val, state, ctx)
             except Exception as e:
+                import traceback
                 log.error(f"Error {symbol}: {e}")
+                log.error(f"  Traceback: {traceback.format_exc().splitlines()[-3:]}")
 
         # Cross pairs (edge demostrado: SOL/ETH WR 42%, AVAX/ETH WR 41%, SOL/BTC WR 33%)
         log.info(f"\n--- CROSS PAIRS [{TF_SETUP}] ---")
@@ -1768,7 +1777,9 @@ def run_bot():
                 log.info(f"\n📊 {symbol}...")
                 analyze_symbol(symbol, pub, _v3_regime, fg_val, state, ctx)
             except Exception as e:
+                import traceback
                 log.error(f"Error {symbol}: {e}")
+                log.error(f"  Traceback: {traceback.format_exc().splitlines()[-3:]}")
 
         # Altcoins (solo si no es RISK_OFF)
         if ctx != Context.RISK_OFF:
@@ -1780,7 +1791,9 @@ def run_bot():
                     log.info(f"\n📊 {symbol}...")
                     analyze_symbol(symbol, pub, _v3_regime, fg_val, state, ctx)
                 except Exception as e:
+                    import traceback
                     log.error(f"Error {symbol}: {e}")
+                    log.error(f"  Traceback: {traceback.format_exc().splitlines()[-3:]}")
         else:
             log.info("⏭️  Altcoins: contexto RISK_OFF — solo majors y shorts")
 
