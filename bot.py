@@ -1,5 +1,5 @@
 """
-CryptoBot v10 — Aggressive Self-Learning Edition
+CryptoBot v11 — Smart Filter Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 APRENDIZAJE AUTOMÁTICO:
 - Signal Memory: guarda qué señales llevaron a cada resultado
@@ -50,11 +50,11 @@ CAPITAL_TOTAL_USD  = float(os.environ.get("CAPITAL_USD", "100"))
 PAPER_TRADING      = os.environ.get("PAPER_TRADING", "true").lower() == "true"
 
 POSITION_SIZE_MAP  = {2: 0.02, 3: 0.03, 4: 0.04, 5: 0.05, 6: 0.06}
-TRAILING_STOP_PCT  = 0.010
-TAKE_PROFIT_PCT    = 0.025
-TAKE_PROFIT_PARTIAL = 0.015  # TP parcial al 1.5% — cierra 50%
-FUTURES_TRAILING   = 0.008
-FUTURES_TP         = 0.020
+TRAILING_STOP_PCT  = 0.025  # 2.5% para 4h
+TAKE_PROFIT_PCT    = 0.050  # 5% para 4h
+TAKE_PROFIT_PARTIAL = 0.030  # 3% para 4h  # TP parcial al 1.5% — cierra 50%
+FUTURES_TRAILING   = 0.020  # 2% para 4h futuros
+FUTURES_TP         = 0.040  # 4% para 4h futuros
 FUTURES_MIN_SCORE  = 4
 FUTURES_LEVERAGE   = 2
 MIN_SIGNALS        = 2
@@ -66,8 +66,8 @@ MAX_WEEKLY_LOSS_PCT  = 0.10
 DRAWDOWN_REDUCE_PCT  = 0.50
 STOP_LOSS_PCT        = 0.03
 BINANCE_FEE_RT       = 0.001   # 0.1% entrada + 0.1% salida = 0.2% round-trip (spot)
-PROFIT_TRAIL_TRIGGER = 0.015
-PROFIT_TRAIL_STEP    = 0.010
+PROFIT_TRAIL_TRIGGER = 0.030  # 3% trigger para 4h
+PROFIT_TRAIL_STEP    = 0.020  # 2% step para 4h
 MAX_CORRELATION_ALTS = 5
 CLAUDE_RATE_LIMIT_SEC = 2
 CLAUDE_MAX_RETRIES   = 3
@@ -79,7 +79,7 @@ BB_STD    = 2.0
 REGIME_TREND_THRESHOLD = 0.02
 REGIME_CRASH_THRESHOLD = -0.05
 
-# v10 — Aggressive Self-Learning
+# v11 — Smart Filter Edition
 SHORT_ENABLED          = True    # habilitar shorts en futuros
 SHORT_MIN_SCORE        = -2.0    # score ponderado mínimo para short (relajado)
 SHORT_MAX_ALTS         = 2       # máx altcoins short simultáneas
@@ -162,6 +162,8 @@ POSITIONS_FILE       = f"{DATA_DIR}/positions.json"
 STATE_FILE           = f"{DATA_DIR}/bot_state.json"
 
 BASE_WATCHLIST = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+# Pares cruzados con edge demostrado en backtest 4h (SOL/ETH WR 42%, AVAX/ETH WR 41%)
+CROSS_PAIRS = ["SOL/ETH", "AVAX/ETH", "SOL/BTC"]
 EXCLUDE_SYMBOLS = {
     "USDT","USDC","BUSD","DAI","TUSD","FDUSD","USDP","USD1","RLUSD","EUR",
     "WBTC","WETH","STETH","BETH","BTC","ETH","SOL","BNB","LDUSDT","XAUT","PAXG"
@@ -509,7 +511,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CryptoBot v10</title>
+<title>CryptoBot v11</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
@@ -691,7 +693,7 @@ footer{text-align:center;font-size:9px;color:var(--t2);margin-top:14px;padding-t
 <!-- HEADER -->
 <div class="hdr">
   <div>
-    <div class="logo">CryptoBot<sup>v10</sup></div>
+    <div class="logo">CryptoBot<sup>v11</sup></div>
   </div>
   <div class="badges">
     <span class="badge badge-live"><span class="dot"></span> LIVE</span>
@@ -883,7 +885,7 @@ footer{text-align:center;font-size:9px;color:var(--t2);margin-top:14px;padding-t
   </div>
 </div>
 
-<footer>CryptoBot v10 · Aggressive Self-Learning · Dynamic Weights · RL · ATR Trailing · Shorts · Entry Confirmation</footer>
+<footer>CryptoBot v11 · Smart Filter · Dynamic Threshold · Long/Short Macro Parity · RL · ATR Trailing</footer>
 </div>
 
 <script>
@@ -1479,7 +1481,7 @@ def scan_top_altcoins(exchange, max_alts=15):
 # ─────────────────────────────────────────
 # INDICADORES
 # ─────────────────────────────────────────
-def get_ohlcv(exchange, symbol, timeframe="1h", limit=150):
+def get_ohlcv(exchange, symbol, timeframe="4h", limit=150):
     raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df  = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
@@ -2281,14 +2283,18 @@ def btc_macro_filter(exchange, direction: str) -> bool:
     now = time.time()
     if now - _btc_macro_cache["ts"] < 900 and _btc_macro_cache["value"] is not None:
         btc_above_ema = _btc_macro_cache["value"]
+        # v11: loguear solo si cambió de estado para reducir ruido
     else:
         try:
             df4h = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "4h", limit=30))
             last = df4h.iloc[-1]
+            prev = _btc_macro_cache["value"]
             btc_above_ema = float(last["close"]) > float(last["ema21"])
             _btc_macro_cache = {"value": btc_above_ema, "ts": now}
+            # v11: loguear siempre que se refresca (cada 15m)
             trend = "↑ BULL" if btc_above_ema else "↓ BEAR"
-            log.info(f"  🌍 BTC 4h macro: {trend} (close={last['close']:.0f} vs EMA21={last['ema21']:.0f})")
+            changed = " [CAMBIO]" if prev is not None and prev != btc_above_ema else ""
+            log.info(f"  🌍 BTC 4h macro: {trend} (close={last['close']:.0f} vs EMA21={last['ema21']:.0f}){changed}")
         except Exception as e:
             log.warning(f"  BTC macro filter error: {e}")
             return True  # si falla, no bloquear
@@ -2456,9 +2462,13 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     rl_min = rl_adjust_min_signals(state)
     rl_adjustment = (rl_min - MIN_SIGNALS_SIDEWAYS) * 0.2  # acotado al 20%
 
-    # C7: Sideways ajusta threshold, no cancela el sistema
+    # C7: Sideways ajusta threshold — v11: señales muy fuertes (>3.5) reducen threshold
     if regime == "sideways":
-        min_threshold = SIDEWAYS_MIN_FLOAT + rl_adjustment
+        # v11: threshold dinámico — señal fuerte baja el umbral
+        if abs(score_float) >= 3.5:
+            min_threshold = 1.5 + rl_adjustment  # señal muy fuerte → más permisivo
+        else:
+            min_threshold = SIDEWAYS_MIN_FLOAT + rl_adjustment
     else:
         min_threshold = float(max(MIN_SIGNALS, rl_min - 1)) + rl_adjustment
 
@@ -2515,6 +2525,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     is_weak = locals().get("is_weak", False)
     is_strong_short = score_float <= -3.0  # señal bajista muy fuerte
 
+    is_strong_long = score_float >= 4.0  # v11: long muy fuerte puede ignorar macro BTC
     if direction_macro == "SHORT":
         if is_strong_short:
             log.info(f"  ✅ Macro filter: short fuerte ({score_float:.1f}) — permitido aunque BTC alcista")
@@ -2524,7 +2535,9 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
             if not btc_macro_filter(public_ex, direction_macro):
                 return
     elif direction_macro == "LONG":
-        if not btc_macro_filter(public_ex, direction_macro):
+        if is_strong_long:
+            log.info(f"  ✅ Macro filter: long fuerte ({score_float:.1f}) — permitido aunque BTC bajista")
+        elif not btc_macro_filter(public_ex, direction_macro):
             return
 
     # ── Filtro 2: Pump/dump y liquidez ───────────────────────────────────────
@@ -2708,22 +2721,33 @@ def run_bot():
         open_positions = load_positions()
         log.info(f"📂 Posiciones: {list(open_positions.keys()) or 'ninguna'} | Capital: ${state.get('capital',100):.2f} | RL min={state.get('rl_min_signals',MIN_SIGNALS_SIDEWAYS)}")
 
-        log.info("\n--- BASE [1h] ---")
+        log.info("\n--- BASE [4h] ---")
         for symbol in BASE_WATCHLIST:
             try:
                 log.info(f"\n📊 {symbol}...")
-                analyze_and_trade(symbol, "1h", public_ex, trade_ex, futures_ex,
+                analyze_and_trade(symbol, "4h", public_ex, trade_ex, futures_ex,
+                                  fg_value, fg_label, open_positions, regime, state)
+                open_positions = load_positions()
+            except Exception as e:
+                log.error(f"Error {symbol}: {e}")
+
+        # Cross pairs (edge demostrado: SOL/ETH WR 42%, AVAX/ETH WR 41%, SOL/BTC WR 33%)
+        log.info("\n--- CROSS PAIRS [4h] ---")
+        for symbol in CROSS_PAIRS:
+            try:
+                log.info(f"\n📊 {symbol}...")
+                analyze_and_trade(symbol, "4h", public_ex, trade_ex, futures_ex,
                                   fg_value, fg_label, open_positions, regime, state)
                 open_positions = load_positions()
             except Exception as e:
                 log.error(f"Error {symbol}: {e}")
 
         if altcoins:
-            log.info("\n--- ALTCOINS [3m] ---")
+            log.info("\n--- ALTCOINS [4h] ---")
             for symbol in altcoins:
                 try:
-                    log.info(f"\n📊 {symbol} [3m]...")
-                    analyze_and_trade(symbol, "3m", public_ex, trade_ex, futures_ex,
+                    log.info(f"\n📊 {symbol} [4h]...")
+                    analyze_and_trade(symbol, "4h", public_ex, trade_ex, futures_ex,
                                       fg_value, fg_label, open_positions, regime, state)
                     open_positions = load_positions()
                 except Exception as e:
