@@ -743,6 +743,7 @@ def update_trailing_stops(exchange, state):
                     pos["partial_closed"] = True
                     pos["usd_size"] = round(pos["usd_size"] * (1 - PARTIAL_SIZE), 2)
                     log.info(f"  ✂️  Partial TP {symbol} @ {price:.6f}")
+                    save_positions(positions)  # fix: persistir partial_closed
 
             # Salida completa
             exit_reason = None
