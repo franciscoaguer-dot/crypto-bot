@@ -610,10 +610,16 @@ def evaluate_entry(symbol, score_long, score_short, families_long, families_shor
         if score_long == 2 and context == Context.NEUTRAL:
             return None, Tier.NONE, "score=2/3 en NEUTRAL → no entra (solo BULL)"
 
-    # ── SHORTS (solo majors) ──────────────────────────────────────────────────
-    if is_major and context in [Context.RISK_OFF, Context.NEUTRAL]:
-        if score_short == 3:
+    # ── SHORTS ───────────────────────────────────────────────────────────────
+    is_cross_pair = symbol in CROSS_PAIRS
+    if context in [Context.RISK_OFF, Context.NEUTRAL]:
+        # Tier A short: majors y cross pairs con 3/3
+        if (is_major or is_cross_pair) and score_short == 3:
             return "SELL", Tier.A, "score=3/3 short Tier A"
+        # Tier B short: majors con 2/3 + confirmación — v3.4.2 novedad
+        if is_major and score_short == 2:
+            if confirm_15m(exchange, symbol, -1):
+                return "SELL", Tier.B, "score=2/3 short Tier B + 15m confirmado"
 
     return None, Tier.NONE, f"score LONG={score_long} SHORT={score_short} insuficiente"
 
@@ -824,8 +830,9 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
 
     is_major = symbol in MAJORS
 
-    # En RISK_OFF solo majors y solo shorts
-    if context == Context.RISK_OFF and not is_major:
+    # En RISK_OFF: majors siempre, cross pairs permitidos (edge demostrado), altcoins no
+    is_cross = symbol in CROSS_PAIRS
+    if context == Context.RISK_OFF and not is_major and not is_cross:
         return False
 
     try:
@@ -837,10 +844,12 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
         log.warning(f"  OHLCV error {symbol}: {e}")
         return False
 
-    # ADX: no operar en mercados sin tendencia (< 20 = lateral)
+    # ADX: no operar en mercados sin tendencia
+    # v3.4.2: umbral dinámico — majors con ADX > 15 pueden pasar si hay señal
     adx_now = float(df["adx"].iloc[-1]) if "adx" in df.columns and not pd.isna(df["adx"].iloc[-1]) else 25.0
-    if adx_now < 20:
-        log.info(f"  ⏭️  ADX={adx_now:.1f} < 20 — lateral, skip")
+    adx_min = 15 if symbol in MAJORS or symbol in CROSS_PAIRS else 20
+    if adx_now < adx_min:
+        log.info(f"  ⏭️  ADX={adx_now:.1f} < {adx_min} — lateral, skip")
         return False
 
     # Calcular familias
@@ -1705,7 +1714,7 @@ def run_bot():
     log.info(f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     log.info("Tier A: 3/3 → entrada fuerte")
     log.info("Tier B: 2/3 + confirmación 1h → entrada reducida (solo en BULL)")
-    log.info("=== v3.4.2 LOADED — ADX, EMA9 alignment, cross pairs ===")
+    log.info("=== v3.5 LOADED — ADX dinámico, cross en RISK_OFF, short Tier B ===")
     log.info("Contexto: BULL / NEUTRAL / RISK_OFF (modificador dinámico)")
 
     send_telegram(
@@ -1796,7 +1805,7 @@ def run_bot():
                     log.error(f"Error {symbol}: {e}")
                     log.error(f"  Traceback: {traceback.format_exc().splitlines()[-3:]}")
         else:
-            log.info("⏭️  Altcoins: contexto RISK_OFF — solo majors y shorts")
+            log.info("⏭️  Altcoins: contexto RISK_OFF — majors + cross pairs activos, altcoins pausadas")
 
         log.info(f"\n💤 {LOOP_SEC}s...")
         time.sleep(LOOP_SEC)
