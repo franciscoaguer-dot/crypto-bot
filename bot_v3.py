@@ -220,11 +220,22 @@ def load_state():
     d = {"capital": CAPITAL_TOTAL_USD, "day_start_capital": CAPITAL_TOTAL_USD,
          "day_start_date": datetime.now(ARG_TZ).strftime("%Y-%m-%d"),
          "daily_circuit": False, "tier_a_count": 0, "tier_b_count": 0}
-    if _USE_PG: return _pg_get("v3_state", d)
-    if os.path.exists(STATE_FILE):
+    loaded = None
+    if _USE_PG:
+        loaded = _pg_get("v3_state", None)
+    elif os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE) as f: return json.load(f)
-        except: pass
+            with open(STATE_FILE) as f: loaded = json.load(f)
+        except Exception as e:
+            log.error(f"load_state file error: {e}")
+
+    if loaded and loaded.get("capital", 0) > 0:
+        log.info(f"  ✅ Estado cargado: capital=${loaded['capital']:.2f} (guardado, no reset)")
+        return loaded
+    elif loaded is not None:
+        log.warning(f"  ⚠️  Estado cargado pero capital inválido ({loaded.get('capital')}) → usando default")
+    else:
+        log.warning("  ⚠️  No se encontró estado guardado → iniciando desde cero (capital default)")
     return d
 
 def save_state(s):
@@ -233,12 +244,19 @@ def save_state(s):
         with open(STATE_FILE, "w") as f: json.dump(s, f, indent=2, default=str)
 
 def load_positions():
-    if _USE_PG: return _pg_get("v3_positions", {})
-    if os.path.exists(POSITIONS_FILE):
+    pos = None
+    if _USE_PG:
+        pos = _pg_get("v3_positions", None)
+    elif os.path.exists(POSITIONS_FILE):
         try:
-            with open(POSITIONS_FILE) as f: return json.load(f)
-        except: pass
-    return {}
+            with open(POSITIONS_FILE) as f: pos = json.load(f)
+        except Exception as e:
+            log.error(f"load_positions file error: {e}")
+    if pos is None:
+        return {}
+    if pos:
+        log.debug(f"  📂 Posiciones cargadas: {list(pos.keys())}")
+    return pos
 
 def save_positions(p):
     if _USE_PG: _pg_set("v3_positions", p)
@@ -1790,6 +1808,15 @@ def run_bot():
     log.info(f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     log.info("Tier A: 3/3 → entrada fuerte")
     log.info("Tier B: 2/3 + confirmación 1h → entrada reducida (solo en BULL)")
+    # ── Verificar estado al arrancar ──────────────────────────────────────────
+    _s_state = load_state()
+    _s_pos   = load_positions()
+    log.info(f"  🔁 STARTUP — capital=${_s_state.get('capital', 0):.2f} | pos={list(_s_pos.keys()) or 'ninguna'}")
+    if _s_pos:
+        log.info(f"  ✅ Posiciones recuperadas: {list(_s_pos.keys())}")
+    else:
+        log.info("  ℹ️  Sin posiciones guardadas — arrancando limpio")
+
     log.info("=== v3.6 LOADED — correlación máx 2 majors, auto-calibración, logging enriquecido ===")
     log.info("Contexto: BULL / NEUTRAL / RISK_OFF (modificador dinámico)")
 
