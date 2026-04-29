@@ -1,5 +1,5 @@
 """
-CryptoBot v11 — Smart Filter Edition
+CryptoBot v12 — Self-Calibrating Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 APRENDIZAJE AUTOMÁTICO:
 - Signal Memory: guarda qué señales llevaron a cada resultado
@@ -79,7 +79,7 @@ BB_STD    = 2.0
 REGIME_TREND_THRESHOLD = 0.02
 REGIME_CRASH_THRESHOLD = -0.05
 
-# v11 — Smart Filter Edition
+# v12 — Self-Calibrating Edition
 SHORT_ENABLED          = True    # habilitar shorts en futuros
 SHORT_MIN_SCORE        = -2.0    # score ponderado mínimo para short (relajado)
 SHORT_MAX_ALTS         = 2       # máx altcoins short simultáneas
@@ -315,6 +315,74 @@ def weighted_score(signals_dict, regime):
 # ─────────────────────────────────────────
 # REINFORCEMENT LEARNING — ajuste por racha
 # ─────────────────────────────────────────
+# ── AUTO-AJUSTE ADAPTATIVO v12 ─────────────────────────────────────────────
+_adaptive_cache = {"threshold_adj": 0.0, "last_check": 0, "streak_reduce_until": 0, "fg_pause_until": 0}
+
+def adaptive_self_calibrate(state: dict, fg_value: int) -> dict:
+    """
+    v12: El bot se auto-ajusta sin intervención externa.
+    - WR < 30% en últimos 10 trades → sube threshold +0.5
+    - WR > 55% en últimos 10 trades → baja threshold -0.3
+    - 3 stops seguidos → size -30% por 2h
+    - F&G < 20 Extreme Fear → pausa longs 6h
+    Rangos acotados: threshold_adj in [-0.5, +1.0]
+    """
+    global _adaptive_cache
+    now = time.time()
+    result = {"threshold_adj": 0.0, "size_mult": 1.0, "pause_longs": False}
+
+    # Aplicar estado actual (sin recalcular)
+    result["threshold_adj"] = _adaptive_cache["threshold_adj"]
+    result["pause_longs"]   = now < _adaptive_cache["fg_pause_until"]
+    result["size_mult"]     = 0.7 if now < _adaptive_cache["streak_reduce_until"] else 1.0
+
+    # Recalcular solo cada 10 minutos
+    if now - _adaptive_cache["last_check"] < 600:
+        return result
+
+    _adaptive_cache["last_check"] = now
+
+    # Cargar últimos trades
+    trades = []
+    try:
+        if _USE_PG:
+            rows = _pg_get("trades")
+            trades = rows if rows else []
+        elif os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE) as f: trades = json.load(f)
+    except: pass
+
+    closed = [t for t in trades if t.get("pnl_pct") is not None and not t.get("partial_exit")]
+    recent = closed[-10:] if len(closed) >= 10 else closed
+
+    # Ajuste de threshold basado en win rate
+    if len(recent) >= 5:
+        wr = sum(1 for t in recent if t.get("pnl_pct", 0) > 0) / len(recent)
+        if wr < 0.30:
+            _adaptive_cache["threshold_adj"] = min(1.0, _adaptive_cache["threshold_adj"] + 0.5)
+            log.info(f"  [AUTO-ADJUST] WR={wr:.0%} bajo → threshold +0.5 (adj total={_adaptive_cache['threshold_adj']:+.1f})")
+        elif wr > 0.55:
+            _adaptive_cache["threshold_adj"] = max(-0.5, _adaptive_cache["threshold_adj"] - 0.3)
+            log.info(f"  [AUTO-ADJUST] WR={wr:.0%} alto → threshold -0.3 (adj total={_adaptive_cache['threshold_adj']:+.1f})")
+
+    # Streak de 3 stops → reducir size 2h
+    if len(recent) >= 3:
+        last3 = recent[-3:]
+        if all(t.get("exit_type", "") in ("stop_loss", "stop_loss_short") for t in last3):
+            _adaptive_cache["streak_reduce_until"] = now + 7200
+            log.info("  [AUTO-ADJUST] 3 stops seguidos → size -30% por 2h")
+
+    # Extreme Fear → pausar longs 6h
+    if fg_value < 20:
+        _adaptive_cache["fg_pause_until"] = now + 21600
+        log.info(f"  [AUTO-ADJUST] F&G={fg_value} Extreme Fear → longs pausados 6h")
+
+    result["threshold_adj"] = _adaptive_cache["threshold_adj"]
+    result["pause_longs"]   = now < _adaptive_cache["fg_pause_until"]
+    result["size_mult"]     = 0.7 if now < _adaptive_cache["streak_reduce_until"] else 1.0
+    return result
+
+
 def rl_adjust_min_signals(state):
     """
     Si hay ≥3 pérdidas seguidas → subir MIN_SIGNALS_SIDEWAYS a 4.
@@ -484,11 +552,8 @@ def check_drawdown(state):
 
 
 def trading_hours_filter() -> bool:
-    """No operar entre 00:00 y 06:00 UTC — volumen bajo, spreads amplios."""
-    hour_utc = datetime.now(timezone.utc).hour
-    if 0 <= hour_utc < 6:
-        log.info(f"  ⏭️  Hora UTC {hour_utc:02d}:xx — fuera de horario (00-06 UTC)")
-        return False
+    """v12: Crypto es 24/7 — sin bloqueo de horario.
+    El volumen bajo ya lo maneja volume_conviction_filter."""
     return True
 
 
@@ -511,7 +576,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CryptoBot v11</title>
+<title>CryptoBot v12</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <style>
@@ -693,7 +758,7 @@ footer{text-align:center;font-size:9px;color:var(--t2);margin-top:14px;padding-t
 <!-- HEADER -->
 <div class="hdr">
   <div>
-    <div class="logo">CryptoBot<sup>v11</sup></div>
+    <div class="logo">CryptoBot<sup>v12</sup></div>
   </div>
   <div class="badges">
     <span class="badge badge-live"><span class="dot"></span> LIVE</span>
@@ -885,7 +950,7 @@ footer{text-align:center;font-size:9px;color:var(--t2);margin-top:14px;padding-t
   </div>
 </div>
 
-<footer>CryptoBot v11 · Smart Filter · Dynamic Threshold · Long/Short Macro Parity · RL · ATR Trailing</footer>
+<footer>CryptoBot v12 · Self-Calibrating · Adaptive Threshold · 24/7 · Exit Logging · RL</footer>
 </div>
 
 <script>
@@ -1400,6 +1465,52 @@ def maybe_send_daily_report(fg_value, fg_label):
     )
     send_telegram(msg)
     log.info("📊 Resumen diario enviado")
+
+def maybe_send_weekly_stats():
+    """v12: Resumen semanal de trades reales — domingos 09:00 ARG via Telegram."""
+    global _last_weekly_backtest
+    now_arg = datetime.now(ARG_TZ)
+    if now_arg.weekday() != 6 or now_arg.hour != 9: return
+    today = now_arg.date()
+    if hasattr(maybe_send_weekly_stats, "_last") and maybe_send_weekly_stats._last == today: return
+    maybe_send_weekly_stats._last = today
+    try:
+        trades_all = []
+        if _USE_PG:
+            trades_all = _pg_get("trades") or []
+        elif os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE) as f: trades_all = json.load(f)
+        closed_all = [t for t in trades_all if t.get("pnl_pct") is not None and not t.get("partial_exit")]
+        if not closed_all:
+            send_telegram("📊 <b>Resumen Semanal v12</b>\nSin trades cerrados aún.")
+            return
+        last7_ts = (datetime.now() - timedelta(days=7)).isoformat()
+        week = [t for t in closed_all if t.get("timestamp","") >= last7_ts]
+        wins_w   = [t for t in week if t.get("pnl_pct",0) > 0]
+        wr_w     = len(wins_w)/len(week)*100 if week else 0
+        pnl_w    = sum(t.get("pnl_pct",0)*t.get("usd_size",20)/100 for t in week)
+        avg_dur  = sum(t.get("duration_min",0) for t in week)/len(week) if week else 0
+        exits    = {}
+        for t in week: exits[t.get("exit_type","?")] = exits.get(t.get("exit_type","?"),0)+1
+        exits_str = " | ".join(f"{k}:{v}" for k,v in sorted(exits.items()))
+        wins_total = [t for t in closed_all if t.get("pnl_pct",0) > 0]
+        wr_total   = len(wins_total)/len(closed_all)*100
+        pf_wins    = sum(t.get("pnl_pct",0) for t in wins_total)
+        pf_losses  = abs(sum(t.get("pnl_pct",0) for t in closed_all if t.get("pnl_pct",0) < 0)) or 0.01
+        pf         = round(pf_wins/pf_losses, 2)
+        adj = _adaptive_cache.get("threshold_adj", 0.0)
+        msg = (
+            f"📊 <b>Resumen Semanal — v12</b>\n"
+            f"<b>Esta semana:</b> {len(week)} trades | WR {wr_w:.0f}% | PnL ${pnl_w:+.2f}\n"
+            f"Duración media: {avg_dur:.0f}min\nExits: {exits_str}\n"
+            f"<b>Total histórico:</b> {len(closed_all)} trades | WR {wr_total:.0f}% | PF {pf}\n"
+            f"Auto-adjust activo: threshold_adj={adj:+.1f}"
+        )
+        send_telegram(msg)
+        log.info(f"[WEEKLY STATS] {msg}")
+    except Exception as e:
+        log.warning(f"Weekly stats error: {e}")
+
 
 def maybe_run_weekly_backtest():
     global _last_weekly_backtest
@@ -2047,7 +2158,7 @@ def update_trailing_stops(public_ex, state):
                         "action":"SELL","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":f"Partial TP 50% @ {current}",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(partial_pnl,2),
-                        "partial_exit":True,"entry_price":pos["entry_price"],"usd_size":partial_usd})
+                        "exit_type":"partial_tp","entry_price":pos["entry_price"],"usd_size":partial_usd})
 
                 # Stop loss absoluto
                 stop_loss_price = pos["entry_price"] * (1 - STOP_LOSS_PCT)
@@ -2060,11 +2171,15 @@ def update_trailing_stops(public_ex, state):
                     if pos.get("signals_snap"):
                         save_signal_to_memory(pos["signals_snap"], pnl, pos.get("regime","sideways"))
                     send_telegram(f"🛑 <b>Stop Loss</b> — {symbol}\n{pnl:+.2f}% ❌")
+                    _dur = round((datetime.now() - datetime.fromisoformat(pos.get("entry_ts", datetime.now().isoformat()))).total_seconds() / 60)
                     save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
                         "action":"SELL","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":f"Stop loss -3%",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
-                        "stop_loss":True,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                        "exit_type":"stop_loss","entry_price":pos["entry_price"],"usd_size":pos["usd_size"],
+                        "entry_score":pos.get("signals_snap",{}).get("score_float",None),
+                        "entry_fg":pos.get("signals_snap",{}).get("fg",None),
+                        "duration_min":_dur, "regime_at_entry":pos.get("regime","?")})
                     closed.append(symbol); continue
 
                 # Profit trailing dinámico
@@ -2088,7 +2203,7 @@ def update_trailing_stops(public_ex, state):
                         "action":"SELL","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":f"Trail stop",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
-                        "trail_triggered":True,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                        "exit_type":"trail","entry_price":pos["entry_price"],"usd_size":pos["usd_size"],"duration_min":round((datetime.now()-datetime.fromisoformat(pos.get("entry_ts",datetime.now().isoformat()))).total_seconds()/60),"regime_at_entry":pos.get("regime","?")})
                     closed.append(symbol); continue
 
                 # Take profit final
@@ -2104,7 +2219,7 @@ def update_trailing_stops(public_ex, state):
                         "action":"SELL","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":f"Take profit",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
-                        "trail_triggered":False,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                        "exit_type":"take_profit","entry_price":pos["entry_price"],"usd_size":pos["usd_size"],"duration_min":round((datetime.now()-datetime.fromisoformat(pos.get("entry_ts",datetime.now().isoformat()))).total_seconds()/60),"regime_at_entry":pos.get("regime","?")})
                     closed.append(symbol)
 
             else:  # ── SHORT ──
@@ -2128,7 +2243,7 @@ def update_trailing_stops(public_ex, state):
                         "action":"BUY","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":"Short stop loss +3%",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
-                        "stop_loss":True,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                        "exit_type":"stop_loss_short","entry_price":pos["entry_price"],"usd_size":pos["usd_size"],"duration_min":round((datetime.now()-datetime.fromisoformat(pos.get("entry_ts",datetime.now().isoformat()))).total_seconds()/60),"regime_at_entry":pos.get("regime","?")})
                     closed.append(symbol); continue
 
                 # Trail stop short — si el precio sube por encima del trail
@@ -2144,7 +2259,7 @@ def update_trailing_stops(public_ex, state):
                         "action":"BUY","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":"Short trail stop",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
-                        "trail_triggered":True,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                        "exit_type":"trail_short","entry_price":pos["entry_price"],"usd_size":pos["usd_size"],"duration_min":round((datetime.now()-datetime.fromisoformat(pos.get("entry_ts",datetime.now().isoformat()))).total_seconds()/60),"regime_at_entry":pos.get("regime","?")})
                     closed.append(symbol); continue
 
                 # Take profit short
@@ -2160,7 +2275,7 @@ def update_trailing_stops(public_ex, state):
                         "action":"BUY","price":current,"timeframe":pos.get("timeframe","1h"),
                         "mode":pos.get("mode","SPOT"),"reasoning":"Short take profit",
                         "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(pnl,2),
-                        "trail_triggered":False,"entry_price":pos["entry_price"],"usd_size":pos["usd_size"]})
+                        "exit_type":"take_profit_short","entry_price":pos["entry_price"],"usd_size":pos["usd_size"],"duration_min":round((datetime.now()-datetime.fromisoformat(pos.get("entry_ts",datetime.now().isoformat()))).total_seconds()/60),"regime_at_entry":pos.get("regime","?")})
                     closed.append(symbol)
         except Exception as e:
             log.error(f"Error trailing {symbol}: {e}")
@@ -2456,6 +2571,10 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     if isinstance(ob_sig, (int, float)):
         # ob_sig -1 = asks dominan, 0 = neutral, +1 = bids dominan
         if ob_sig < 0: ob_size_mult = 0.8  # asks dominan → reducir size
+    # v12: reducción por streak de stops
+    _adp = adaptive_self_calibrate(state, fg_value)
+    if _adp["size_mult"] < 1.0:
+        ob_size_mult *= _adp["size_mult"]
 
     # ── SCORE mínimo dinámico: RL acotado (C9) ──────────────────────────────
     # RL puede mover el threshold ±0.5 máximo — no domina el sistema
@@ -2463,14 +2582,20 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     rl_adjustment = (rl_min - MIN_SIGNALS_SIDEWAYS) * 0.2  # acotado al 20%
 
     # C7: Sideways ajusta threshold — v11: señales muy fuertes (>3.5) reducen threshold
+    # v12: auto-calibrate aplica ajuste adicional basado en WR reciente
+    adaptive = adaptive_self_calibrate(state, fg_value)
+    adaptive_adj = adaptive["threshold_adj"]
+    if adaptive_adj != 0:
+        log.info(f"  [AUTO-ADJUST] threshold_adj={adaptive_adj:+.1f} size_mult={adaptive['size_mult']:.0%} pause_longs={adaptive['pause_longs']}")
+
     if regime == "sideways":
-        # v11: threshold dinámico — señal fuerte baja el umbral
         if abs(score_float) >= 3.5:
-            min_threshold = 1.5 + rl_adjustment  # señal muy fuerte → más permisivo
+            min_threshold = 1.5 + rl_adjustment + adaptive_adj
         else:
-            min_threshold = SIDEWAYS_MIN_FLOAT + rl_adjustment
+            min_threshold = SIDEWAYS_MIN_FLOAT + rl_adjustment + adaptive_adj
     else:
-        min_threshold = float(max(MIN_SIGNALS, rl_min - 1)) + rl_adjustment
+        min_threshold = float(max(MIN_SIGNALS, rl_min - 1)) + rl_adjustment + adaptive_adj
+    min_threshold = max(1.5, min(4.5, min_threshold))  # nunca fuera de rango
 
     if abs(score_float) < min_threshold:
         log.info(
@@ -2526,6 +2651,11 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     is_strong_short = score_float <= -3.0  # señal bajista muy fuerte
 
     is_strong_long = score_float >= 4.0  # v11: long muy fuerte puede ignorar macro BTC
+    # v12: respetar pausa de longs por Extreme Fear
+    adaptive_now = adaptive_self_calibrate(state, fg_value)
+    if adaptive_now["pause_longs"] and direction_macro == "LONG" and not is_strong_long:
+        log.info("  ⏭️  [AUTO-ADJUST] Longs pausados (Extreme Fear reciente) — skip")
+        return
     if direction_macro == "SHORT":
         if is_strong_short:
             log.info(f"  ✅ Macro filter: short fuerte ({score_float:.1f}) — permitido aunque BTC alcista")
@@ -2609,7 +2739,8 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         if PAPER_TRADING:
             save_trade({**base_record, "paper": True, "order_id": None})
             open_position(symbol, current_price, usd_size, risk_pct, "BUY", timeframe, mode_label, signals_snap, atr_value)
-            log.info(f"  📝 PAPER {mode_label} BUY @ {current_price} | Trail={trail_stop} TP={take_profit} ATR={atr_value:.4f if atr_value else 'N/A'}")
+            atr_str = f'{atr_value:.4f}' if atr_value else 'N/A'
+            log.info(f"  📝 PAPER {mode_label} BUY @ {current_price} | Trail={trail_stop} TP={take_profit} ATR={atr_str}")
             allocated_now = get_allocated_capital(open_positions)
             send_telegram(
                 f"📝 <b>PAPER {'🚀' if use_futures else '✅'} {mode_label} [{timeframe}]</b>\n"
