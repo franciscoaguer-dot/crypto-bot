@@ -43,6 +43,7 @@ HERENCIA DE v2 (intacto):
 """
 
 import os, re, time, json, logging, requests, threading, collections
+import time
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 import ccxt
@@ -680,7 +681,7 @@ def tick_cooldowns():
 # ─────────────────────────────────────────
 # GESTIÓN DE POSICIONES
 # ─────────────────────────────────────────
-def open_position(symbol, entry_price, usd_size, action, atr_value, tier, context, regime="bull"):
+def open_position(symbol, entry_price, usd_size, action, atr_value, tier, context, regime="bull", fg_value=None):
     positions = load_positions()
     is_short  = action == "SELL"
 
@@ -709,6 +710,8 @@ def open_position(symbol, entry_price, usd_size, action, atr_value, tier, contex
         "trail_pct": trail_pct, "tier": tier.value,
         "context_entry": context.value,
         "opened_at": datetime.now().isoformat(),
+        "regime_entry": regime,
+        "fg_at_entry": fg_value,
     }
     save_positions(positions)
     log.info(f"  ✅ ABIERTA {symbol} {action} Tier {tier.value} @ {entry_price} "
@@ -782,14 +785,22 @@ def update_trailing_stops(exchange, state):
                     f"PnL: {pnl:+.2f}% | ${usd_pnl:+.2f}\n"
                     f"Capital: ${state['capital']:.2f} | Ctx: {pos.get('context_entry','?')}"
                 )
+                _dur_min = round(
+                    (datetime.now() - datetime.fromisoformat(
+                        pos.get("opened_at", datetime.now().isoformat())
+                    )).total_seconds() / 60
+                )
                 save_trade({
                     "timestamp": datetime.now().isoformat(),
                     "symbol": symbol, "action": pos["action"],
                     "entry": pos["entry_price"], "exit": price,
                     "pnl_pct": pnl, "pnl_gross_pct": pnl_gross, "usd_pnl": usd_pnl,
-                    "reason": exit_reason, "usd_size": pos["usd_size"],
+                    "reason": exit_reason, "exit_type": exit_reason,
+                    "usd_size": pos["usd_size"], "duration_min": _dur_min,
                     "tier": pos.get("tier"), "context_entry": pos.get("context_entry"),
                     "partial": pos["partial_closed"],
+                    "fg_at_entry": pos.get("fg_at_entry"),
+                    "regime_at_entry": pos.get("regime_entry", "?"),
                 })
                 set_cooldown(symbol)
                 del positions[symbol]
@@ -800,6 +811,56 @@ def update_trailing_stops(exchange, state):
 # ─────────────────────────────────────────
 # CIRCUIT BREAKER
 # ─────────────────────────────────────────
+# ── AUTO-CALIBRACIÓN v3.5 ──────────────────────────────────────────────────
+_v3_adaptive = {"size_mult": 1.0, "pause_longs_until": 0, "streak_reduce_until": 0, "last_check": 0}
+
+def v3_adaptive_calibrate(fg_value: int) -> dict:
+    """
+    v3.5: Auto-ajuste sin intervención.
+    - 3 stops seguidos → size -30% por 2h
+    - F&G < 20 Extreme Fear → pausa longs 6h
+    Retorna dict {size_mult, pause_longs}
+    """
+    global _v3_adaptive
+    now = time.time()
+    result = {
+        "size_mult":   _v3_adaptive["size_mult"],
+        "pause_longs": now < _v3_adaptive["pause_longs_until"],
+    }
+
+    # Recalcular solo cada 10 minutos
+    if now - _v3_adaptive["last_check"] < 600:
+        return result
+
+    _v3_adaptive["last_check"] = now
+
+    # F&G < 20 → pausar longs 6h
+    if fg_value < 20:
+        _v3_adaptive["pause_longs_until"] = now + 21600
+        log.info(f"  [AUTO-ADJUST v3] F&G={fg_value} Extreme Fear → longs pausados 6h")
+
+    # Cargar últimos trades para detectar streak de stops
+    trades = []
+    try:
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE) as f: trades = json.load(f)
+    except: pass
+
+    closed = [t for t in trades if t.get("pnl_pct") is not None and not t.get("partial")]
+    if len(closed) >= 3:
+        last3 = closed[-3:]
+        if all(t.get("exit_type", t.get("reason", "")) in ("stop_loss", "trail", "sl") and t.get("pnl_pct", 0) < 0 for t in last3):
+            _v3_adaptive["streak_reduce_until"] = now + 7200
+            _v3_adaptive["size_mult"] = 0.7
+            log.info("  [AUTO-ADJUST v3] 3 stops seguidos → size -30% por 2h")
+        elif now > _v3_adaptive["streak_reduce_until"]:
+            _v3_adaptive["size_mult"] = 1.0
+
+    result["size_mult"]   = _v3_adaptive["size_mult"]
+    result["pause_longs"] = now < _v3_adaptive["pause_longs_until"]
+    return result
+
+
 def check_daily_circuit(state) -> bool:
     today = datetime.now(ARG_TZ).strftime("%Y-%m-%d")
     if state.get("day_start_date") != today:
@@ -896,7 +957,14 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
     # Control correlación altcoins
     # Tier A (3/3): ignora límite — setup fuerte, vale la pena
     # Tier B (2/3): límite aumentado a 5 altcoins abiertas
-    open_alts = [s for s in open_pos if s not in MAJORS]
+    open_alts   = [s for s in open_pos if s not in MAJORS]
+    open_majors = [s for s in open_pos if s in MAJORS]
+    # v3.5: máximo 2 majors simultáneos — BTC/ETH/SOL/BNB están 95% correlacionados
+    # Tener 4 juntos = 4x la misma apuesta, no diversificación
+    MAX_CONCURRENT_MAJORS = 2
+    if symbol in MAJORS and len(open_majors) >= MAX_CONCURRENT_MAJORS:
+        log.info(f"  ⏭️  {symbol}: ya hay {len(open_majors)} majors abiertos (máx {MAX_CONCURRENT_MAJORS}) — skip")
+        return False
     alt_limit = 999 if tier == Tier.A else 5
     if not is_major and len(open_alts) >= alt_limit:
         log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas (límite Tier B={alt_limit})")
@@ -927,11 +995,19 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
              f"| Tier {tier.value} | size=${usd_size} | ctx={context.value}")
 
     if PAPER_TRADING:
-        open_position(symbol, price, usd_size, action, atr, tier, context, _v3_regime)
+        # v3.6: auto-calibración antes de abrir
+        _adp = v3_adaptive_calibrate(fg_value)
+        if _adp["pause_longs"] and action == "BUY":
+            log.info("  ⏭️  [AUTO-ADJUST v3] Longs pausados (Extreme Fear) — skip")
+            return False
+        _usd_size = round(usd_size * _adp["size_mult"], 2) if _adp["size_mult"] < 1.0 else usd_size
+        if _adp["size_mult"] < 1.0:
+            log.info(f"  [AUTO-ADJUST v3] size reducido {_adp['size_mult']:.0%} → ${_usd_size}")
+        open_position(symbol, price, _usd_size, action, atr, tier, context, _v3_regime, fg_value=fg_value)
         send_telegram(
             f"📝 <b>v3 PAPER {action} {symbol}</b> [Tier {tier.value}]\n"
             f"Score: {score}/3 | Contexto: {context.value.upper()}\n"
-            f"Precio: {price:.6f} | Size: ${usd_size}\n"
+            f"Precio: {price:.6f} | Size: ${_usd_size}\n"
             f"F&G: {fg_value} | Régimen: {regime_val}\n"
             f"Motivo: {reason}"
         )
@@ -1714,7 +1790,7 @@ def run_bot():
     log.info(f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
     log.info("Tier A: 3/3 → entrada fuerte")
     log.info("Tier B: 2/3 + confirmación 1h → entrada reducida (solo en BULL)")
-    log.info("=== v3.5 LOADED — ADX dinámico, cross en RISK_OFF, short Tier B ===")
+    log.info("=== v3.6 LOADED — correlación máx 2 majors, auto-calibración, logging enriquecido ===")
     log.info("Contexto: BULL / NEUTRAL / RISK_OFF (modificador dinámico)")
 
     send_telegram(
