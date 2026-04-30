@@ -557,15 +557,50 @@ def trading_hours_filter() -> bool:
     return True
 
 
-def losing_positions_filter(open_positions: dict) -> bool:
-    """No abrir nuevas posiciones si ya hay 2 o más en pérdida simultánea."""
-    losing = [s for s, p in open_positions.items()
-              if p.get("current_price") and p.get("entry_price") and
-              ((p["action"] == "BUY"  and p["current_price"] < p["entry_price"]) or
-               (p["action"] == "SELL" and p["current_price"] > p["entry_price"]))]
-    if len(losing) >= 2:
-        log.info(f"  ⏭️  {len(losing)} posiciones en pérdida ({', '.join(losing)}) — no abrir más")
+def losing_positions_filter(open_positions: dict, capital: float = 1000.0) -> bool:
+    """v12: Bloquear nuevas entradas solo si el drawdown total supera -5% del capital.
+    Antes: bloqueaba con 2 pérdidas cualquiera (ej: -0.3% + -0.2% = bloqueado).
+    Ahora: permite entrar mientras las pérdidas acumuladas sean manejables.
+    Umbral: -5% del capital (~$50 en $1000) → drawdown real, no cantidad de posiciones.
+    """
+    DRAWDOWN_BLOCK_PCT = -0.05  # -5% del capital total
+
+    losing = {}
+    for s, p in open_positions.items():
+        if not (p.get("current_price") and p.get("entry_price") and p.get("usd_size")):
+            continue
+        if p["action"] == "BUY":
+            pnl_pct = (p["current_price"] - p["entry_price"]) / p["entry_price"]
+        else:
+            pnl_pct = (p["entry_price"] - p["current_price"]) / p["entry_price"]
+        if pnl_pct < 0:
+            losing[s] = pnl_pct
+
+    if not losing:
+        return True
+
+    # Calcular drawdown total en $ usando el usd_size de cada posición
+    total_drawdown_usd = sum(
+        open_positions[s].get("usd_size", 0) * losing[s]
+        for s in losing
+    )
+    drawdown_pct = total_drawdown_usd / capital if capital > 0 else 0
+
+    if drawdown_pct <= DRAWDOWN_BLOCK_PCT:
+        losing_str = ", ".join(f"{s}({v:+.1%})" for s, v in losing.items())
+        log.info(
+            f"  ⏭️  Drawdown acumulado {drawdown_pct:.1%} < {DRAWDOWN_BLOCK_PCT:.0%} "
+            f"— no abrir más ({losing_str})"
+        )
         return False
+
+    # Permitir pero loguear si hay pérdidas leves
+    if losing:
+        losing_str = ", ".join(f"{s}({v:+.1%})" for s, v in losing.items())
+        log.info(
+            f"  ⚠️  Pérdidas leves {drawdown_pct:.1%} < {DRAWDOWN_BLOCK_PCT:.0%} "
+            f"— seguimos operando ({losing_str})"
+        )
     return True
 
 # ─────────────────────────────────────────
@@ -950,7 +985,7 @@ footer{text-align:center;font-size:9px;color:var(--t2);margin-top:14px;padding-t
   </div>
 </div>
 
-<footer>CryptoBot v12 · Self-Calibrating · Adaptive Threshold · 24/7 · Exit Logging · RL</footer>
+<footer>CryptoBot v12 · Self-Calibrating · Drawdown Filter · Adaptive Threshold · 24/7 · Exit Logging · RL</footer>
 </div>
 
 <script>
@@ -2638,7 +2673,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         return
     if not trading_hours_filter():
         return
-    if not losing_positions_filter(open_positions):
+    if not losing_positions_filter(open_positions, state.get("capital", 1000.0)):
         return
 
     # ── Filtro 1: Macro BTC 4h ──────────────────────────────────────────────
