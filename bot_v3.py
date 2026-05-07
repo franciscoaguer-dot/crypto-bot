@@ -975,7 +975,8 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
     # Control correlación altcoins
     # Tier A (3/3): ignora límite — setup fuerte, vale la pena
     # Tier B (2/3): límite aumentado a 5 altcoins abiertas
-    open_alts   = [s for s in open_pos if s not in MAJORS]
+    _cross_set  = set(CROSS_PAIRS)
+    open_alts   = [s for s in open_pos if s not in MAJORS and s not in _cross_set]
     open_majors = [s for s in open_pos if s in MAJORS]
     # v3.5: máximo 2 majors simultáneos — BTC/ETH/SOL/BNB están 95% correlacionados
     # Tener 4 juntos = 4x la misma apuesta, no diversificación
@@ -984,7 +985,8 @@ def analyze_symbol(symbol, exchange, regime, fg_value, state, context) -> bool:
         log.info(f"  ⏭️  {symbol}: ya hay {len(open_majors)} majors abiertos (máx {MAX_CONCURRENT_MAJORS}) — skip")
         return False
     alt_limit = 999 if tier == Tier.A else 5
-    if not is_major and len(open_alts) >= alt_limit:
+    is_cross = symbol in _cross_set
+    if not is_major and not is_cross and len(open_alts) >= alt_limit:
         log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas (límite Tier B={alt_limit})")
         return False
 
