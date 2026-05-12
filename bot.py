@@ -2424,36 +2424,48 @@ _btc_macro_cache = {"value": None, "ts": 0}
 
 def btc_macro_filter(exchange, direction: str) -> bool:
     """
-    Filtro macro: solo abrir LONG si BTC 4h está por encima de EMA21.
-    Solo abrir SHORT si BTC 4h está por debajo de EMA21.
-    Evita entrar en contra de la tendencia mayor.
+    Filtro macro v12: LONG permitido si BTC 4h está dentro de ±0.3% de EMA21
+    o por encima. Solo bloquea si BTC está claramente bajista (>0.3% bajo EMA21).
+    Tolerancia del 0.3% evita falsos bloqueos por ruido de mercado sideways.
     Cache de 15 minutos para no spammear la API.
     """
+    MACRO_TOLERANCE = 0.003  # 0.3% — diferencia mínima para considerar tendencia real
+
     global _btc_macro_cache
     now = time.time()
     if now - _btc_macro_cache["ts"] < 900 and _btc_macro_cache["value"] is not None:
         btc_above_ema = _btc_macro_cache["value"]
-        # v11: loguear solo si cambió de estado para reducir ruido
     else:
         try:
             df4h = calculate_indicators(get_ohlcv(exchange, "BTC/USDT", "4h", limit=30))
             last = df4h.iloc[-1]
+            close = float(last["close"])
+            ema21 = float(last["ema21"])
+            diff_pct = (close - ema21) / ema21  # positivo = alcista, negativo = bajista
+
+            # Con tolerancia: bajista REAL solo si más de 0.3% por debajo
+            btc_above_ema = diff_pct > -MACRO_TOLERANCE
+
             prev = _btc_macro_cache["value"]
-            btc_above_ema = float(last["close"]) > float(last["ema21"])
             _btc_macro_cache = {"value": btc_above_ema, "ts": now}
-            # v11: loguear siempre que se refresca (cada 15m)
-            trend = "↑ BULL" if btc_above_ema else "↓ BEAR"
+
+            if diff_pct > MACRO_TOLERANCE:
+                trend = "↑ BULL"
+            elif diff_pct < -MACRO_TOLERANCE:
+                trend = "↓ BEAR"
+            else:
+                trend = "↔ SIDEWAYS"
             changed = " [CAMBIO]" if prev is not None and prev != btc_above_ema else ""
-            log.info(f"  🌍 BTC 4h macro: {trend} (close={last['close']:.0f} vs EMA21={last['ema21']:.0f}){changed}")
+            log.info(f"  🌍 BTC 4h macro: {trend} (close={close:.0f} vs EMA21={ema21:.0f}, diff={diff_pct:+.2%}){changed}")
         except Exception as e:
             log.warning(f"  BTC macro filter error: {e}")
             return True  # si falla, no bloquear
 
     if direction == "LONG" and not btc_above_ema:
-        log.info("  ⏭️  Macro filter: BTC 4h bajista — no abrir LONG")
+        log.info("  ⏭️  Macro filter: BTC 4h claramente bajista (>0.3%) — no abrir LONG")
         return False
     if direction == "SHORT" and btc_above_ema:
-        log.info("  ⏭️  Macro filter: BTC 4h alcista — no abrir SHORT")
+        log.info("  ⏭️  Macro filter: BTC 4h alcista/neutral — no abrir SHORT")
         return False
     return True
 
