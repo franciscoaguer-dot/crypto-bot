@@ -1,6 +1,12 @@
 """
-CryptoBot v12 — Self-Calibrating Edition
+CryptoBot v13 — Short Unleashed Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEJORAS v13:
+- Shorts habilitados para CUALQUIER par (no solo majors)
+- Score mínimo SHORT_MIN_SCORE=-2.0 aplica a todos los timeframes
+- Size conservador para altcoin shorts (65% del size normal)
+- Partial TP implementado también para posiciones short
+- Cap separado SHORT_MAX_ALTS=2 para altcoin shorts simultáneas
 APRENDIZAJE AUTOMÁTICO:
 - Signal Memory: guarda qué señales llevaron a cada resultado
 - Dynamic Weights: ponderación por win rate histórico (no +1 fijo)
@@ -2264,6 +2270,22 @@ def update_trailing_stops(public_ex, state):
                     pos["trail_stop"] = round(current * (1 + trail_pct), 4)
                     log.info(f"  📉 Short Trail {symbol}: {pos['trail_stop']}")
 
+                # SALIDA PARCIAL SHORT — cerrar 50% al primer TP parcial
+                if not pos.get("partial_closed") and current <= pos.get("partial_tp", 0):
+                    partial_pnl = apply_fee((pos["entry_price"] - current) / pos["entry_price"] * 100, pos.get("mode","FUTURES 2x"))
+                    partial_usd = pos["usd_size"] * PARTIAL_EXIT_PCT
+                    log.info(f"  ½ SHORT PARTIAL TP {symbol} @ {current} | PnL parcial: +{partial_pnl:.2f}%")
+                    pos["partial_closed"] = True
+                    pos["usd_size"]      = round(pos["usd_size"] * (1 - PARTIAL_EXIT_PCT), 2)
+                    pnl_usd = partial_pnl * partial_usd / 100
+                    update_compounding(state, pnl_usd)
+                    send_telegram(f"½ <b>Short Partial TP</b> — {symbol}\n+{partial_pnl:.2f}% — cerrando 50%\nDejando correr con trailing")
+                    save_trade({"timestamp": datetime.now().isoformat(), "symbol": symbol,
+                        "action":"BUY","price":current,"timeframe":pos.get("timeframe","4h"),
+                        "mode":pos.get("mode","FUTURES 2x"),"reasoning":f"Short partial TP 50% @ {current}",
+                        "confidence":1.0,"paper":PAPER_TRADING,"pnl_pct":round(partial_pnl,2),
+                        "exit_type":"partial_tp_short","entry_price":pos["entry_price"],"usd_size":partial_usd})
+
                 # Stop loss short — si el precio SUBE más del 3%
                 stop_loss_price = pos["entry_price"] * (1 + STOP_LOSS_PCT)
                 if current >= stop_loss_price:
@@ -2655,7 +2677,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     if score_float < 0 and not SHORT_ENABLED:
         log.info("  ⏭️  Bajista y shorts deshabilitados — skip")
         return
-    if timeframe == "3m" and score_float < 0 and score_float > SHORT_MIN_SCORE:
+    if score_float < 0 and score_float > SHORT_MIN_SCORE:
         log.info(f"  ⏭️  Short score {score_float:+.1f} insuficiente (mínimo {SHORT_MIN_SCORE}) — skip")
         return
 
@@ -2678,6 +2700,12 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
     if symbol not in base_symbols and len(open_alts) >= MAX_CORRELATION_ALTS:
         log.info(f"  ⏭️  Correlación: {len(open_alts)} altcoins abiertas — skip")
         return
+    # Cap separado para altcoin shorts
+    if score_float < 0 and symbol not in base_symbols:
+        open_alt_shorts = [s for s in open_alts if open_positions[s].get("action") == "SELL"]
+        if len(open_alt_shorts) >= SHORT_MAX_ALTS:
+            log.info(f"  ⏭️  Máx shorts altcoin: {len(open_alt_shorts)}/{SHORT_MAX_ALTS} — skip")
+            return
 
     # ── Filtro 0: Circuit breakers globales ─────────────────────────────────
     if state.get("daily_drawdown_mode"):
@@ -2808,23 +2836,32 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
                 send_telegram(f"{'🚀' if use_futures else '✅'} <b>{mode_label}</b> — {symbol} @ {actual}\n💰 ${usd_size}×{leverage}")
 
     elif analysis["action"] == "SELL" and analysis["confidence"] >= CONFIDENCE_MIN:
-        # v10 fix: permitir shorts en futuros para majors con score fuerte
-        # aunque el timeframe base sea spot (1h), si el score es ≤ -2.5 y es major
+        # v13: shorts habilitados para cualquier par con score suficientemente bajista
+        # Condición unificada: score <= SHORT_MIN_SCORE (-2.0) + régimen no alcista
+        short_regime_ok = regime in ("sideways", "bear", "crash")
+        altcoin_short_ok = (
+            score_float <= SHORT_MIN_SCORE
+            and short_regime_ok
+        )
         is_major_sym = any(symbol.startswith(m) for m in ["BTC", "ETH", "SOL", "BNB"])
+        # Majors necesitan score un poco más fuerte (más líquidos pero más ruido)
         major_short_ok = (
             is_major_sym
             and score_float <= -2.5
-            and regime in ("sideways", "bear", "crash")
+            and short_regime_ok
         )
-        if not use_futures and not major_short_ok:
-            log.info("  ⏭️  SELL requiere futuros — skip")
+        can_short = use_futures or altcoin_short_ok or major_short_ok
+        if not can_short:
+            log.info(f"  ⏭️  SELL: score={score_float:+.1f} insuficiente para short (min={SHORT_MIN_SCORE}) o régimen={regime} — skip")
             return
-        if not use_futures and major_short_ok:
-            # Forzar futuros para short en major con score fuerte
+        if not use_futures:
+            # Forzar futuros para cualquier short válido
             use_futures = True
-            usd_size    = round(usd_size * 0.75, 2)  # size reducido 25%
+            # Size conservador: 75% para majors, 65% para altcoins (más volátiles)
+            size_mult   = 0.75 if is_major_sym else 0.65
+            usd_size    = round(usd_size * size_mult, 2)
             mode_label  = f"FUTURES {FUTURES_LEVERAGE}x"
-            log.info(f"  ⚡ Major short habilitado: score={score_float:+.1f} régimen={regime} size=${usd_size}")
+            log.info(f"  ⚡ Short habilitado vía futuros: {'major' if is_major_sym else 'altcoin'} score={score_float:+.1f} régimen={regime} size=${usd_size}")
         if PAPER_TRADING:
             save_trade({**base_record, "paper": True, "order_id": None})
             open_position(symbol, current_price, usd_size, risk_pct, "SELL", timeframe, mode_label, signals_snap, atr_value)
@@ -2846,16 +2883,16 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v10 — Aggressive Self-Learning Edition")
+    log.info("🤖 CryptoBot v13 — Short Unleashed Edition")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v10 — Aggressive Self-Learning</b>\n"
+        f"🤖 <b>CryptoBot v13 — Short Unleashed</b>\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
         f"💾 Persistencia: PostgreSQL\n"
-        f"🌍 Filtro macro BTC 4h | 🛡️ Pump/dump filter\n"
-        f"📊 Volume conviction | 🛑 Circuit breaker diario\n"
-        f"⏰ Sin trading 00-06 UTC | 📉 Max 2 posiciones en pérdida\n"
+        f"📉 Shorts en cualquier par (score ≤ {SHORT_MIN_SCORE})\n"
+        f"🛡️ Cap: {SHORT_MAX_ALTS} altcoin shorts simultáneas\n"
+        f"½ Partial TP habilitado para longs Y shorts\n"
         f"Spot trail {TRAILING_STOP_PCT*100}% (ATR cap 3%) | Futuros {FUTURES_LEVERAGE}x"
     )
 
