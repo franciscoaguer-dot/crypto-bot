@@ -1,6 +1,10 @@
 """
-CryptoBot v13 — Short Unleashed Edition
+CryptoBot v14 — Short Optimized Edition
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MEJORAS v14:
+- ATR threshold diferencial: 8% para shorts fuertes (≤-3.0), 7% para longs fuertes (≥4.0), 5% default
+- Extreme Fear no pausa shorts — miedo extremo es favorable para posiciones bajistas
+- Filtro de noticias negativas relajado para shorts: bloquea solo si news ≤ -2 (antes era -1)
 MEJORAS v13:
 - Shorts habilitados para CUALQUIER par (no solo majors)
 - Score mínimo SHORT_MIN_SCORE=-2.0 aplica a todos los timeframes
@@ -2492,7 +2496,7 @@ def btc_macro_filter(exchange, direction: str) -> bool:
     return True
 
 
-def pump_dump_filter(df: pd.DataFrame, symbol: str, fr_val: float) -> bool:
+def pump_dump_filter(df: pd.DataFrame, symbol: str, fr_val: float, score_float: float = 0.0) -> bool:
     """
     Detecta pumps artificiales y condiciones de baja liquidez.
     Retorna False si NO se debe entrar.
@@ -2501,6 +2505,8 @@ def pump_dump_filter(df: pd.DataFrame, symbol: str, fr_val: float) -> bool:
     - Precio subió/bajó >8% en las últimas 4 velas → pump/dump en curso
     - Funding extremo en altcoin desconocida (>0.5% o <-0.5%)
     - Volatilidad ATR >5% del precio → mercado demasiado errático
+      Excepción v14: shorts fuertes (score ≤ -3.0) permiten ATR hasta 8%
+                     longs fuertes (score ≥ 4.0) permiten ATR hasta 7%
     """
     last  = df.iloc[-1]
     prev4 = df.iloc[-5] if len(df) >= 5 else df.iloc[0]
@@ -2518,9 +2524,16 @@ def pump_dump_filter(df: pd.DataFrame, symbol: str, fr_val: float) -> bool:
         return False
 
     # ATR demasiado alto — volatilidad extrema
+    # v14: threshold más permisivo para shorts fuertes (exactamente cuando el ATR es alto)
     if not pd.isna(last.get("atr", float("nan"))):
         atr_pct = float(last["atr"]) / float(last["close"])
-        if atr_pct > 0.05:
+        if score_float <= -3.0:
+            atr_threshold = 0.08   # 8% para shorts fuertes
+        elif score_float >= 4.0:
+            atr_threshold = 0.07   # 7% para longs fuertes
+        else:
+            atr_threshold = 0.05   # 5% default
+        if atr_pct > atr_threshold:
             log.info(f"  ⏭️  Pump/dump filter: ATR {atr_pct*100:.1f}% — volatilidad extrema, skip")
             return False
 
@@ -2622,8 +2635,12 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
         f"CCI:{cci_sig:+d} SQZ:{squeeze_sig:+d} SR:{sr_sig:+d} CANDLE:{candle_sig:+d}"
     )
 
-    # C5: News como filtro — noticias muy negativas bloquean, positivas ajustan size
-    if n_sig <= -1:
+    # C5: News como filtro — noticias muy negativas bloquean longs, positivas ajustan size
+    # v14: para shorts, solo bloquear si las noticias son extremadamente negativas (≤ -2)
+    #      Noticias moderadamente negativas (-1) son consistentes con un short
+    direction_hint_news = "long" if score_float > 0 else "short"
+    news_block_threshold = -1 if direction_hint_news == "long" else -2
+    if n_sig <= news_block_threshold:
         log.info(f"  ⏭️  News muy negativas ({n_sig}) — skip")
         return
     news_size_mult = 1.1 if n_sig >= 1 else 1.0
@@ -2727,10 +2744,14 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
 
     is_strong_long = score_float >= 4.0  # v11: long muy fuerte puede ignorar macro BTC
     # v12: respetar pausa de longs por Extreme Fear
+    # v14: la pausa aplica SOLO a longs — shorts en Extreme Fear están permitidos
     adaptive_now = adaptive_self_calibrate(state, fg_value)
     if adaptive_now["pause_longs"] and direction_macro == "LONG" and not is_strong_long:
         log.info("  ⏭️  [AUTO-ADJUST] Longs pausados (Extreme Fear reciente) — skip")
         return
+    # Shorts en Extreme Fear: permitidos sin restricción (el miedo extremo favorece shorts)
+    if adaptive_now["pause_longs"] and direction_macro == "SHORT":
+        log.info("  ℹ️  [AUTO-ADJUST] Extreme Fear activo — short permitido")
     if direction_macro == "SHORT":
         if is_strong_short:
             log.info(f"  ✅ Macro filter: short fuerte ({score_float:.1f}) — permitido aunque BTC alcista")
@@ -2746,7 +2767,7 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
             return
 
     # ── Filtro 2: Pump/dump y liquidez ───────────────────────────────────────
-    if not pump_dump_filter(df, symbol, fr_val):
+    if not pump_dump_filter(df, symbol, fr_val, score_float):
         return
 
     # ── Filtro 3: Volumen de convicción ──────────────────────────────────────
@@ -2883,16 +2904,16 @@ def analyze_and_trade(symbol, timeframe, public_ex, trade_ex, futures_ex,
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────
 def run_bot():
-    log.info("🤖 CryptoBot v13 — Short Unleashed Edition")
+    log.info("🤖 CryptoBot v14 — Short Optimized Edition")
     log.info(f"Mode: {'PAPER' if PAPER_TRADING else 'REAL'} | Capital: ${CAPITAL_TOTAL_USD}")
 
     send_telegram(
-        f"🤖 <b>CryptoBot v13 — Short Unleashed</b>\n"
+        f"🤖 <b>CryptoBot v14 — Short Optimized</b>\n"
         f"Mode: {'📝 PAPER' if PAPER_TRADING else '💰 REAL'}\n"
         f"💾 Persistencia: PostgreSQL\n"
-        f"📉 Shorts en cualquier par (score ≤ {SHORT_MIN_SCORE})\n"
-        f"🛡️ Cap: {SHORT_MAX_ALTS} altcoin shorts simultáneas\n"
-        f"½ Partial TP habilitado para longs Y shorts\n"
+        f"📉 ATR threshold: 8% shorts fuertes / 7% longs fuertes / 5% default\n"
+        f"😱 Extreme Fear no bloquea shorts\n"
+        f"📰 News ≤-2 bloquea shorts (antes -1)\n"
         f"Spot trail {TRAILING_STOP_PCT*100}% (ATR cap 3%) | Futuros {FUTURES_LEVERAGE}x"
     )
 
